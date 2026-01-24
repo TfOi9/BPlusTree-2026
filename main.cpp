@@ -182,7 +182,7 @@ struct Page {
     }
 
     int lower_bound(const KeyPair& key) {
-        int l = 0, r = size_ - 1, mid = -1, ans = -1;
+        int l = 0, r = size_ - 1, mid = -1, ans = r;
         while (l <= r) {
             mid = (l + r) / 2;
             if (data_[mid] < key) {
@@ -265,6 +265,47 @@ public:
                     curk = 0;
                 }
             }
+        }
+    }
+
+    void insert(const KeyPair& kp) {
+        if (root_ == 0) {
+            Page newr;
+            newr.size_ = 1;
+            newr.type_ = PageType::Leaf;
+            newr.data_[0] = kp;
+            root_ = disk_.write(newr);
+            return;
+        }
+        pos_ = root_;
+        disk_.read(cur_, root_);
+        while (cur_.type_ != PageType::Leaf) {
+            int k = cur_.lower_bound(kp);
+            if (cur_.data_[k] < kp) {
+                cur_.data_[k] = kp;
+                disk_.update(cur_, pos_);
+            }
+            pos_ = cur_.ch_[k];
+            disk_.read(cur_, pos_);
+        }
+        int k = cur_.lower_bound(kp);
+        if (cur_.data_[k] == kp) {
+            return;
+        }
+        if (k == cur_.size_ - 1) {
+            cur_.size_++;
+            cur_.data_[cur_.size_ - 1] = kp;
+        }
+        else {
+            for (int i = cur_.size_ - 1; i >= k; i--) {
+                cur_.data_[i + 1] = cur_.data_[i];
+            }
+            cur_.data_[k] = kp;
+            cur_.size_++;
+        }
+        disk_.update(cur_, pos_);
+        if (cur_.size_ == SLOTS) {
+            split();
         }
     }
 
