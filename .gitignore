@@ -1,0 +1,12 @@
+.clangd
+.in
+.out
+.ans
+.err
+.log
+.bin
+.dat
+build/*
+test/*
+tools/%
+.DS_Store
