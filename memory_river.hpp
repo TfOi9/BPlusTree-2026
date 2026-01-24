@@ -48,7 +48,7 @@ public:
             get_info(size_, 1);
         }
         else {
-            size_ = 0;
+            size_ = 1;
         }
         // std::cerr << file_name << " " << size_ << std::endl;
         return f;
