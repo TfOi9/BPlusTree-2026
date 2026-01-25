@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <climits>
 #include <iostream>
 #include <fstream>
@@ -309,6 +310,46 @@ public:
         }
     }
 
+    void erase(const KeyPair& kp) {
+        if (root_ == 0) {
+            return;
+        }
+        pos_ = root_;
+        disk_.read(cur_, pos_);
+        while (cur_.type_ != PageType::Leaf) {
+            int k = cur_.lower_bound(kp);
+            pos_ = cur_.ch_[k];
+            disk_.read(cur_, pos_);
+        }
+        int k = cur_.lower_bound(kp);
+        if (cur_.data_[k] != kp) {
+            return;
+        }
+        for (int i = k; i < cur_.size_ - 1; i++) {
+            cur_.data_[i + 1] = cur_.data_[i];
+        }
+        cur_.size_--;
+        disk_.update(cur_, pos_);
+        KeyPair max_pair = cur_.back();
+        Page f;
+        int fpos = cur_.fa_;
+        while (fpos != -1) {
+            disk_.read(f, fpos);
+            int p = f.lower_bound(kp);
+            if (f.data_[p] == kp) {
+                f.data_[p] = max_pair;
+                disk_.update(f, fpos);
+                fpos = f.fa_;
+            }
+            else {
+                break;
+            }
+        }
+        if (cur_.size_ < SLOTS / 2) {
+            balance();
+        }
+    }
+
 private:
     MemoryRiver<Page> disk_;
     Page cur_;
@@ -446,5 +487,200 @@ private:
         }
     }
 
-    void merge();
+    bool borrowl() {
+        if (cur_.fa_ == -1 || cur_.size_ == 0) {
+            // no father or empty
+            return false;
+        }
+        int fpos = cur_.fa_;
+        Page f;
+        KeyPair max_pair = cur_.back();
+        disk_.read(f, fpos);
+        int k = f.lower_bound(max_pair);
+        if (!k) {
+            // nothing in the left
+            return false;
+        }
+        Page bro;
+        int bpos = f.ch_[k - 1];
+        disk_.read(bro, bpos);
+        if (bro.size_ <= SLOTS / 2) {
+            return false;
+        }
+        for (int i = cur_.size_ - 1; i >= 0; i--) {
+            cur_.data_[i + 1] = cur_.data_[i];
+            cur_.ch_[i + 1] = cur_.ch_[i];
+        }
+        cur_.data_[0] = bro.back();
+        cur_.ch_[0] = bro.ch_[bro.size_ - 1];
+        cur_.size_++;
+        bro.size_--;
+        if(cur_.type_ == PageType::Internal) {
+            Page son;
+            disk_.read(son, cur_.ch_[0]);
+            son.fa_ = pos_;
+            disk_.update(son, cur_.ch_[0]);
+        }
+        f.data_[k - 1] = bro.back();
+        disk_.update(cur_, pos_);
+        disk_.update(bro, bpos);
+        disk_.update(f, fpos);
+        return true;
+    }
+
+    bool borrowr() {
+        if (cur_.fa_ == -1 || cur_.size_ == 0) {
+            // no father or empty
+            return false;
+        }
+        int fpos = cur_.fa_;
+        Page f;
+        disk_.read(f, fpos);
+        KeyPair max_pair = cur_.back();
+        int k = f.lower_bound(max_pair);
+        if (k == f.size_ - 1) {
+            // nothing in the right
+            return false;
+        }
+        Page bro;
+        int bpos = f.ch_[k + 1];
+        if (bro.size_ <= SLOTS / 2) {
+            return false;
+        }
+        cur_.data_[cur_.size_] = bro.data_[0];
+        cur_.ch_[cur_.size_] = bro.ch_[0];
+        cur_.size_++;
+        for (int i = 0; i < bro.size_ - 1; i++) {
+            bro.data_[i] = bro.data_[i + 1];
+            bro.ch_[i] = bro.ch_[i + 1];
+        }
+        bro.size_--;
+        if (cur_.type_ == PageType::Internal) {
+            Page son;
+            disk_.read(son, cur_.ch_[cur_.size_ - 1]);
+            son.fa_ = pos_;
+            disk_.update(son, cur_.ch_[cur_.size_ - 1]);
+        }
+        f.data_[k] = cur_.back();
+        disk_.update(cur_, pos_);
+        disk_.update(bro, bpos);
+        disk_.update(f, fpos);
+        return true;
+    }
+
+    void merge() {
+        if (cur_.fa_ == -1) {
+            // no father
+            return;
+        }
+        int fpos = cur_.fa_;
+        Page f;
+        KeyPair max_pair = cur_.back();
+        disk_.read(f, fpos);
+        int k = cur_.lower_bound(max_pair);
+        if (k) {
+            // merge with the left
+            Page bro;
+            int bpos = f.ch_[k - 1];
+            disk_.read(bro, bpos);
+            if (cur_.type_ == PageType::Internal) {
+                for (int i = 0; i < cur_.size_; i++) {
+                    Page son;
+                    disk_.read(son, cur_.ch_[i]);
+                    son.fa_ = bpos;
+                    disk_.update(son, cur_.ch_[i]);
+                }
+            }
+            for (int i = 0; i < cur_.size_ - 1; i++) {
+                bro.data_[bro.size_ + i] = cur_.data_[i];
+                bro.ch_[bro.size_ + 1] = cur_.ch_[i];
+            }
+            bro.size_ += cur_.size_;
+            cur_.size_ = 0;
+            bro.right_ = cur_.right_;
+            if (cur_.right_ != -1) {
+                Page rp;
+                disk_.read(rp, cur_.right_);
+                rp.left_ = bpos;
+                disk_.update(rp, cur_.right_);
+            }
+            for (int i = k; i < f.size_ - 1; i++) {
+                f.data_[i] = f.data_[i + 1];
+                f.ch_[i] = f.ch_[i + 1];
+            }
+            f.size_--;
+            f.data_[k - 1] = bro.back();
+            disk_.update(bro, bpos);
+            disk_.update(f, fpos);
+            if (f.size_ < SLOTS / 2) {
+                // father needs balance
+                pos_ = fpos;
+                cur_ = f;
+                balance();
+            }
+        }
+        else if (k != f.size_ - 1) {
+            // merge with the right
+            Page bro;
+            int bpos = f.ch_[k + 1];
+            disk_.read(bro, bpos);
+            if (cur_.type_ == PageType::Internal) {
+                for (int i = 0; i < cur_.size_; i++) {
+                    Page son;
+                    disk_.read(son, cur_.ch_[i]);
+                    son.fa_ = bpos;
+                    disk_.update(son, cur_.ch_[i]);
+                }
+            }
+            for (int i = 0; i < bro.size_; i++) {
+                cur_.data_[cur_.size_ + i] = bro.data_[i];
+                cur_.ch_[cur_.size_ + i] = bro.ch_[i];
+            }
+            cur_.size_ += bro.size_;
+            bro.size_ = 0;
+            cur_.right_ = bro.right_;
+            if (bro.right_ != -1) {
+                Page rp;
+                disk_.read(rp, bro.right_);
+                rp.left_ = pos_;
+                disk_.update(rp, bro.right_);
+            }
+            for (int i = k + 1; i < f.size_ - 1; i++) {
+                f.data_[i] = f.data_[i + 1];
+                f.ch_[i] = f.ch_[i + 1];
+            }
+            f.size_--;
+            f.data_[k] = cur_.back();
+            disk_.update(cur_, pos_);
+            disk_.update(f, fpos);
+            if (f.size_ < SLOTS / 2) {
+                pos_ = fpos;
+                cur_ = f;
+                balance();
+            }
+        }
+    }
+
+    void balance() {
+        if (cur_.fa_ == -1) {
+            // at root
+            if (cur_.size_ == 0) {
+                // now empty
+                root_ = 0;
+            }
+            if (cur_.type_ == PageType::Internal && cur_.size_ == 1) {
+                // root to be removed
+                Page son;
+                disk_.read(son, cur_.ch_[0]);
+                son.fa_ = -1;
+                disk_.update(son, cur_.ch_[0]);
+                root_ = cur_.ch_[0];
+            }
+            return;
+        }
+        if (borrowl()) return;
+        if (borrowr()) return;
+        merge();
+    }
+
 };
