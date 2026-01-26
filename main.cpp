@@ -19,14 +19,12 @@ private:
     int sizeofT = sizeof(T);
     int info_offset = info_len * sizeof(int);
 
-    int size_;
 public:
-    MemoryRiver() : size_(1) {}
+    MemoryRiver() {}
 
     MemoryRiver(const string& file_name) : file_name(file_name) {}
 
     ~MemoryRiver() {
-        write_info(size_, 1);
         if (file.is_open()) {
             file.close();
         }
@@ -38,6 +36,10 @@ public:
             file.open(file_name, std::ios::out | std::ios::binary);
             file.close();
             file.open(file_name, std::ios::in | std::ios::out | std::ios::binary);
+            int temp = 0;
+            for (int i = 0; i < info_len; i++) {
+                file.write(reinterpret_cast<char *>(&temp), sizeof(int));
+            }
             return 0;
         }
         return 1;
@@ -46,13 +48,7 @@ public:
     bool initialise(string FN = "") {
         if (FN != "") file_name = FN;
         bool f = open_file();
-        if (f) {
-            get_info(size_, 1);
-        }
-        else {
-            size_ = 0;
-        }
-        // std::cerr << file_name << " " << size_ << std::endl;
+        std::cerr << "memory river opened file " << file_name << std::endl;
         return f;
     }
 
@@ -81,26 +77,23 @@ public:
     }
 
     int write(T &t) {
-        int siz = size_;
-        size_++;
-        file.seekp(info_offset + siz * sizeofT);
+        file.seekp(0, std::ios::end);
+        int pos = file.tellp();
+        std::cerr << pos << std::endl;
         file.write(reinterpret_cast<char *>(&t), sizeofT);
-        return siz;
+        return pos;
     }
 
     void update(T &t, const int pos) {
-        file.seekp(info_offset + pos * sizeofT);
+        file.seekp(pos);
         file.write(reinterpret_cast<char *>(&t), sizeofT);
     }
 
     void read(T &t, const int pos) {
-        file.seekg(info_offset + pos * sizeofT);
+        file.seekg(pos);
         file.read(reinterpret_cast<char *>(&t), sizeofT);
     }
 
-    int size() const {
-        return size_;
-    }
 };
 
 struct KeyPair {
@@ -111,7 +104,7 @@ struct KeyPair {
         memset(key_, 0, sizeof(key_));
     }
 
-    KeyPair(char key[65], int val) : val_(val) {
+    KeyPair(const char key[65], int val) : val_(val) {
         memcpy(key_, key, sizeof(char) * 65);
     }
 
@@ -167,7 +160,8 @@ enum class PageType {
     Internal
 };
 
-constexpr int SLOTS = 200;
+constexpr int SLOTS = 4;
+static_assert(SLOTS % 2 == 0, "Slot count must be even!");
 
 struct Page {
     KeyPair data_[SLOTS + 2];
@@ -208,13 +202,14 @@ public:
     BPlusTree(const std::string file_name = "bpt.dat") {
         disk_.initialise(file_name);
         disk_.get_info(root_, 2);
+        std::cerr << "opened bpt file " << file_name << " with root at " << root_ << std::endl;
     }
     
     ~BPlusTree() {
         disk_.write_info(root_, 2);
     }
 
-    std::optional<int> find(char key[65]) {
+    std::optional<int> find(const char key[65]) {
         KeyPair kp(key, INT_MIN);
         if (root_ == 0) {
             return std::nullopt;
@@ -233,28 +228,35 @@ public:
         return cur_.data_[k].val_;
     }
 
-    void find_all(char key[65], std::vector<int>& vec) {
+    void find_all(const char key[65], std::vector<int>& vec) {
         vec.clear();
         KeyPair kp(key, INT_MIN);
         if (root_ == 0) {
             return;
         }
         pos_ = root_;
+        std::cerr << "currently at " << root_ << std::endl;
         disk_.read(cur_, root_);
+        std::cerr << "current page type is " << (cur_.type_ == PageType::Leaf ? "Leaf" : (cur_.type_ == PageType::Internal ? "Internal" : "Invalid")) << std::endl;
         while (cur_.type_ != PageType::Leaf) {
             int k = cur_.lower_bound(kp);
             pos_ = cur_.ch_[k];
             disk_.read(cur_, pos_);
         }
         int k = cur_.lower_bound(kp);
+        std::cerr << "now at page " << pos_ << ", found at slot " << k << std::endl;
+        std::cerr << "slot contains key " << cur_.data_[k].key_ << std::endl;
         if (strcmp(cur_.data_[k].key_, key)) {
             return;
         }
         int curk = k;
         while (strcmp(cur_.data_[curk].key_, key) == 0) {
+            std::cerr << "now at slot " << curk << std::endl;
+            std::cerr << "size " << cur_.size_ << std::endl;
             vec.push_back(cur_.data_[curk].val_);
             if (curk < cur_.size_ - 1) {
                 curk++;
+                std::cerr << cur_.data_[curk].key_ << std::endl;
             }
             else {
                 if (cur_.right_ == -1) {
@@ -276,6 +278,7 @@ public:
             newr.type_ = PageType::Leaf;
             newr.data_[0] = kp;
             root_ = disk_.write(newr);
+            std::cerr << "created new page as root, numbered " << root_ << std::endl;
             return;
         }
         pos_ = root_;
@@ -293,9 +296,9 @@ public:
         if (cur_.data_[k] == kp) {
             return;
         }
-        if (k == cur_.size_ - 1) {
+        if (cur_.data_[k] < kp) {
+            cur_.data_[k + 1] = kp;
             cur_.size_++;
-            cur_.data_[cur_.size_ - 1] = kp;
         }
         else {
             for (int i = cur_.size_ - 1; i >= k; i--) {
@@ -326,7 +329,7 @@ public:
             return;
         }
         for (int i = k; i < cur_.size_ - 1; i++) {
-            cur_.data_[i + 1] = cur_.data_[i];
+            cur_.data_[i] = cur_.data_[i + 1];
         }
         cur_.size_--;
         disk_.update(cur_, pos_);
@@ -390,13 +393,13 @@ private:
                 f.ch_[fa_pos] = pos_;
                 f.ch_[fa_pos + 1] = newp_pos;
                 f.size_++;
-                cur_.right_ = newp_pos;
-                if (newp.right_ != -1) {
+                if (cur_.right_ != -1) {
                     Page rp;
-                    disk_.read(rp, newp.right_);
+                    disk_.read(rp, cur_.right_);
                     rp.left_ = newp_pos;
-                    disk_.update(rp, newp.right_);
+                    disk_.update(rp, cur_.right_);
                 }
+                cur_.right_ = newp_pos;
                 disk_.update(f, cur_.fa_);
                 disk_.update(cur_, pos_);
                 if (f.size_ == SLOTS) {
@@ -452,13 +455,13 @@ private:
                 f.ch_[fa_pos] = pos_;
                 f.ch_[fa_pos + 1] = newp_pos;
                 f.size_++;
-                cur_.right_ = newp_pos;
-                if (newp.right_ != -1) {
+                if (cur_.right_ != -1) {
                     Page rp;
-                    disk_.read(rp, newp.right_);
+                    disk_.read(rp, cur_.right_);
                     rp.left_ = newp_pos;
-                    disk_.update(rp, newp.right_);
+                    disk_.update(rp, cur_.right_);
                 }
+                cur_.right_ = newp_pos;
                 disk_.update(f, cur_.fa_);
                 disk_.update(cur_, pos_);
                 disk_.update(newp, newp_pos);
@@ -544,6 +547,7 @@ private:
         }
         Page bro;
         int bpos = f.ch_[k + 1];
+        disk_.read(bro, bpos);
         if (bro.size_ <= SLOTS / 2) {
             return false;
         }
@@ -577,7 +581,7 @@ private:
         Page f;
         KeyPair max_pair = cur_.back();
         disk_.read(f, fpos);
-        int k = cur_.lower_bound(max_pair);
+        int k = f.lower_bound(max_pair);
         if (k) {
             // merge with the left
             Page bro;
@@ -591,9 +595,9 @@ private:
                     disk_.update(son, cur_.ch_[i]);
                 }
             }
-            for (int i = 0; i < cur_.size_ - 1; i++) {
+            for (int i = 0; i < cur_.size_; i++) {
                 bro.data_[bro.size_ + i] = cur_.data_[i];
-                bro.ch_[bro.size_ + 1] = cur_.ch_[i];
+                bro.ch_[bro.size_ + i] = cur_.ch_[i];
             }
             bro.size_ += cur_.size_;
             cur_.size_ = 0;
@@ -625,11 +629,11 @@ private:
             int bpos = f.ch_[k + 1];
             disk_.read(bro, bpos);
             if (cur_.type_ == PageType::Internal) {
-                for (int i = 0; i < cur_.size_; i++) {
+                for (int i = 0; i < bro.size_; i++) {
                     Page son;
-                    disk_.read(son, cur_.ch_[i]);
-                    son.fa_ = bpos;
-                    disk_.update(son, cur_.ch_[i]);
+                    disk_.read(son, bro.ch_[i]);
+                    son.fa_ = pos_;
+                    disk_.update(son, bro.ch_[i]);
                 }
             }
             for (int i = 0; i < bro.size_; i++) {
@@ -684,3 +688,40 @@ private:
     }
 
 };
+
+int main() {
+    std::ios::sync_with_stdio(0);
+    std::cin.tie(0);
+    std::cout.tie(0);
+    BPlusTree bpt;
+    int q;
+    std::cin >> q;
+    while (q--) {
+        std::string op, key;
+        int val;
+        std::cin >> op;
+        if (op == "insert") {
+            std::cin >> key >> val;
+            bpt.insert(KeyPair(key.c_str(), val));
+        }
+        else if (op == "find") {
+            std::cin >> key;
+            std::vector<int> vec;
+            bpt.find_all(key.c_str(), vec);
+            if (vec.empty()) {
+                std::cout << "null\n";
+            }
+            else {
+                for (auto v : vec) {
+                    std::cout << v << ' ';
+                }
+                std::cout << '\n';
+            }
+        }
+        else if (op == "delete") {
+            std::cin >> key >> val;
+            bpt.erase(KeyPair(key.c_str(), val));
+        }
+    }
+    return 0;
+}

@@ -6,6 +6,7 @@
 .log
 .bin
 .dat
+.txt
 build/*
 test/*
 tools/%
