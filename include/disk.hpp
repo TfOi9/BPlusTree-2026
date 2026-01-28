@@ -5,6 +5,7 @@
 #include <fstream>
 
 #include "config.hpp"
+#include "type_helper.hpp"
 
 namespace sjtu {
 #define DISKMANAGER_TYPE DiskManager<FixedType, FixedInfoType, info_len>
@@ -18,6 +19,7 @@ private:
     constexpr static diskpos_t sizeofT = sizeof(FixedType);
     constexpr static diskpos_t sizeofInfo = sizeof(FixedInfoType);
     constexpr static diskpos_t info_offset = info_len * sizeofInfo;
+    static_assert(is_pod_v<FixedType>, "DiskManager requires POD FixedType");
 
     bool open_file();
 

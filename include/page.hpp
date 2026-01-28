@@ -2,6 +2,8 @@
 #define PAGE_HPP
 
 #include "config.hpp"
+#include "comparator.hpp"
+#include "type_helper.hpp"
 
 namespace sjtu {
 #define KEYPAIR_TYPE KeyPair<KeyType, ValueType>
@@ -28,7 +30,14 @@ struct KeyPair {
 
 KEYPAIR_TEMPLATE_ARGS
 bool operator==(const KEYPAIR_TYPE& a, const KEYPAIR_TYPE& b) {
-    return a.key_ == b.key_ && a.val_ == b.val_;
+    if constexpr (has_operator_equal_v<KeyType> && has_operator_equal_v<ValueType>) {
+        return a.key_ == b.key_ && a.val_ == b.val_;
+    }
+    else {
+        Comparator<KeyType> key_comp;
+        Comparator<ValueType> val_comp;
+        return key_comp(a.key_, b.key_) == 0 && val_comp(a.val_, b.val_) == 0;
+    }
 }
 
 KEYPAIR_TEMPLATE_ARGS
@@ -38,18 +47,34 @@ bool operator!=(const KEYPAIR_TYPE& a, const KEYPAIR_TYPE& b) {
 
 KEYPAIR_TEMPLATE_ARGS
 bool operator>(const KEYPAIR_TYPE& a, const KEYPAIR_TYPE& b) {
-    if (a.key_ == b.key_) {
-        return a.val_ > b.val_;
+    if constexpr (has_operator_greater_v<KeyType> && has_operator_greater_v<ValueType>) {
+        if (a.key_ == b.key_) {
+            return a.val_ > b.val_;
+        }
+        return a.key_ > b.key_;
+    } else {
+        Comparator<KeyType> key_comp;
+        Comparator<ValueType> val_comp;
+        int k = key_comp(a.key_, b.key_);
+        if (k == 0) return val_comp(a.val_, b.val_) > 0;
+        return k > 0;
     }
-    return a.key_ > b.key_;
 }
 
 KEYPAIR_TEMPLATE_ARGS
 bool operator<(const KEYPAIR_TYPE& a, const KEYPAIR_TYPE& b) {
-    if (a.key_ == b.key_) {
-        return a.val_ < b.val_;
+    if constexpr (has_operator_less_v<KeyType> && has_operator_less_v<ValueType>) {
+        if (a.key_ == b.key_) {
+            return a.val_ < b.val_;
+        }
+        return a.key_ < b.key_;
+    } else {
+        Comparator<KeyType> key_comp;
+        Comparator<ValueType> val_comp;
+        int k = key_comp(a.key_, b.key_);
+        if (k == 0) return val_comp(a.val_, b.val_) < 0;
+        return k < 0;
     }
-    return a.key_ < b.key_;
 }
 
 KEYPAIR_TEMPLATE_ARGS

@@ -1,7 +1,11 @@
 #ifndef COMPARATOR_HPP
 #define COMPARATOR_HPP
 
+#include <type_traits>
+#include <cstddef>
+
 #include "config.hpp"
+#include "type_helper.hpp"
 
 namespace sjtu {
 #define MEMORYHASH_TYPE MemoryHash<FixedType>
@@ -17,6 +21,7 @@ private:
     hash_t hash1_;
     hash_t hash2_;
     constexpr static size_t sizeofT = sizeof(FixedType);
+    static_assert(is_pod_v<FixedType>, "MemoryHash requires POD FixedType");
 public:
     MemoryHash(const FixedType& data);
 
@@ -30,10 +35,10 @@ MEMORYHASH_TEMPLATE_ARGS
 MEMORYHASH_TYPE::MemoryHash(const FixedType& data) : data_(data) {
     hash1_ = 0;
     hash2_ = 0;
-    char *str = reinterpret_cast<char *>(data_);
+    const unsigned char *bytes = reinterpret_cast<const unsigned char *>(&data_);
     for (size_t i = 0; i < sizeofT; i++) {
-        hash1_ = (hash1_ * HASH_BASE1 + hash_t(str[i])) % HASH_MOD1;
-        hash2_ = (hash2_ * HASH_BASE2 + hash_t(str[i])) % HASH_MOD2;
+        hash1_ = (hash1_ * HASH_BASE1 + hash_t(bytes[i])) % HASH_MOD1;
+        hash2_ = (hash2_ * HASH_BASE2 + hash_t(bytes[i])) % HASH_MOD2;
     }
 }
 
