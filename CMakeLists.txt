@@ -10,4 +10,4 @@ include_directories(include)
 
 add_executable(code src/main.cpp)
 
-add_executable(cleanup cleanup.cpp)
+add_executable(cleanup src/cleanup.cpp)
