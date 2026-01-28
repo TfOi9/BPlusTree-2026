@@ -158,6 +158,9 @@ void BUFFER_MANAGER_TYPE::mark_dirty(diskpos_t pos) {
 
 BUFFER_MANAGER_TEMPLATE_ARGS
 diskpos_t BUFFER_MANAGER_TYPE::insert_page(Page<KeyType, ValueType> &page) {
+    if (cache_.size() >= cache_capacity_) {
+        evict();
+    }
     diskpos_t pos = disk_.write(page);
     std::shared_ptr<PAGE_TYPE> page_ptr = std::make_shared<PAGE_TYPE>(page);
     CacheEntry entry;
