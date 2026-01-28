@@ -9,6 +9,6 @@
 .txt
 build/*
 test/*
-tools/%
+tools/*
 temp/*
 .DS_Store

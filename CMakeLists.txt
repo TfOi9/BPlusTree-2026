@@ -8,8 +8,6 @@ set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -g")
 
 include_directories(include)
 
-add_executable(main main.cpp)
-
 add_executable(code src/main.cpp)
 
 add_executable(cleanup cleanup.cpp)
