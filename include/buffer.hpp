@@ -180,6 +180,7 @@ void BUFFER_MANAGER_TYPE::flush() {
     }
     cache_.clear();
     lru_list_.clear();
+    cache_in_use_.clear();
 }
 
 BUFFER_MANAGER_TEMPLATE_ARGS

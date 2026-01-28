@@ -46,7 +46,9 @@ public:
 };
 
 BPT_TEMPLATE_ARGS
-BPT_TYPE::BPlusTree(const std::string file_name) : buffer_(CACHE_CAPACITY, file_name) {}
+BPT_TYPE::BPlusTree(const std::string file_name) : buffer_(CACHE_CAPACITY, file_name) {
+    root_ = buffer_.get_root_pos();
+}
 
 BPT_TEMPLATE_ARGS
 BPT_TYPE::~BPlusTree() {
