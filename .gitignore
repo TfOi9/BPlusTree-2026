@@ -10,4 +10,5 @@
 build/*
 test/*
 tools/%
+temp/*
 .DS_Store
