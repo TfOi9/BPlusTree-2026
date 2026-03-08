@@ -7,11 +7,14 @@
 namespace sjtu {
 
 typedef int64_t diskpos_t;
+typedef int32_t page_id_t;
 
-constexpr size_t PAGE_SLOT_COUNT = 200;
-static_assert(PAGE_SLOT_COUNT % 2 == 0, "Slot count must be even!");
+constexpr page_id_t INVALID_PAGE_ID = -1;
 
-constexpr size_t CACHE_CAPACITY = 1600;
+// Each page is a fixed-size 4KB block on disk and in memory.
+constexpr size_t PAGE_SIZE = 4096;
+
+constexpr size_t CACHE_CAPACITY = 4096;
 
 typedef int64_t hash_t;
 
@@ -19,6 +22,8 @@ constexpr hash_t HASH_MOD1 = 998244353;
 constexpr hash_t HASH_MOD2 = 1000000007;
 constexpr hash_t HASH_BASE1 = 10007;
 constexpr hash_t HASH_BASE2 = 9973;
+
+constexpr page_id_t HEADER_PAGE_ID = 0;
 
 } // namespace sjtu
 

@@ -2,545 +2,684 @@
 #define BPT_HPP
 
 #include <optional>
+#include <shared_mutex>
 #include <string>
+#include <utility>
+#include <vector>
 
+#include "buffer.hpp"
 #include "config.hpp"
 #include "page.hpp"
-#include "buffer.hpp"
+#include "page_guard.hpp"
 
 namespace sjtu {
-#define BPT_TYPE BPlusTree<KeyType, ValueType>
-#define BPT_TEMPLATE_ARGS template<typename KeyType, typename ValueType>
 
-BPT_TEMPLATE_ARGS
+template<typename KeyType, typename ValueType>
 class BPlusTree {
 private:
-    BUFFER_MANAGER_TYPE buffer_;
-    std::shared_ptr<const PAGE_TYPE> cur_;
-    diskpos_t pos_;
-    diskpos_t root_ = 0;
+    using KeyPairType = KeyPair<KeyType, ValueType>;
+    using LeafPageType = LeafPage<KeyType, ValueType>;
+    using InternalPageType = InternalPage<KeyType, ValueType>;
 
-    void split();
+    struct Context {
+        std::vector<ReadPageGuard> read_set_;
+        std::vector<WritePageGuard> write_set_;
 
-    bool borrowl();
-
-    bool borrowr();
-
-    void merge();
-
-    void balance();
-
-public:
-    BPlusTree(const std::string file_name = "bpt.dat");
-
-    ~BPlusTree();
-
-    std::optional<ValueType> find(const KeyType& key);
-
-    void find_all(const KeyType& key, std::vector<ValueType>& vec);
-
-    void insert(const KeyType& key, const ValueType& val);
-
-    void erase(const KeyType& key, const ValueType& val);
-
-};
-
-BPT_TEMPLATE_ARGS
-BPT_TYPE::BPlusTree(const std::string file_name) : buffer_(CACHE_CAPACITY, file_name) {
-    root_ = buffer_.get_root_pos();
-}
-
-BPT_TEMPLATE_ARGS
-BPT_TYPE::~BPlusTree() {
-    buffer_.set_root_pos(root_);
-}
-
-BPT_TEMPLATE_ARGS
-std::optional<ValueType> BPT_TYPE::find(const KeyType& key) {
-    if (root_ == 0) {
-        return std::nullopt;
-    }
-    pos_ = root_;
-    cur_ = buffer_.get_page(pos_);
-    while (cur_->type_ != PageType::Leaf) {
-        int k = cur_->lower_bound(key);
-        pos_ = cur_->ch_[k];
-        cur_ = buffer_.get_page(pos_);
-    }
-    int k = cur_->lower_bound(key);
-    if (cur_->data_[k].key_ != key) {
-        return std::nullopt;
-    }
-    return cur_->data_[k].val_;
-}
-
-BPT_TEMPLATE_ARGS
-void BPT_TYPE::find_all(const KeyType& key, std::vector<ValueType>& vec) {
-    vec.clear();
-    if (root_ == 0) {
-        return;
-    }
-    pos_ = root_;
-    cur_ = buffer_.get_page(pos_);
-    while (cur_->type_ != PageType::Leaf) {
-        int k = cur_->lower_bound(key);
-        pos_ = cur_->ch_[k];
-        cur_ = buffer_.get_page(pos_);
-    }
-    int k = cur_->lower_bound(key);
-    if (cur_->data_[k].key_ != key) {
-        return;
-    }
-    int curk = k;
-    while (cur_->data_[curk].key_ == key) {
-        vec.push_back(cur_->data_[curk].val_);
-        if (curk < cur_->size_ - 1) {
-            curk++;
+        void ClearRead() {
+            for (auto it = read_set_.rbegin(); it != read_set_.rend(); ++it) {
+                it->Drop();
+            }
+            read_set_.clear();
         }
-        else {
-            if (cur_->right_ == -1) {
+
+        void ClearWrite() {
+            for (auto it = write_set_.rbegin(); it != write_set_.rend(); ++it) {
+                it->Drop();
+            }
+            write_set_.clear();
+        }
+
+        void Clear() {
+            ClearRead();
+            ClearWrite();
+        }
+    };
+
+    BufferManager buffer_;
+    mutable std::shared_mutex tree_latch_;
+
+    static_assert(sizeof(LeafPageType) <= PAGE_SIZE, "LeafPage exceeds PAGE_SIZE");
+    static_assert(sizeof(InternalPageType) <= PAGE_SIZE, "InternalPage exceeds PAGE_SIZE");
+
+    static bool KeyEqualValue(const KeyType &a, const KeyType &b) {
+        return key_equal(a, b);
+    }
+
+    ReadPageGuard FetchRead(page_id_t page_id) {
+        return ReadPageGuard(&buffer_, buffer_.FetchPageForGuard(page_id));
+    }
+
+    WritePageGuard FetchWrite(page_id_t page_id) {
+        return WritePageGuard(&buffer_, buffer_.FetchPageForGuard(page_id));
+    }
+
+    template<typename PageT>
+    WritePageGuard NewPage(page_id_t page_id) {
+        WritePageGuard guard(&buffer_, buffer_.NewPageForGuard(page_id));
+        auto *page = guard.template AsMut<PageT>();
+        page->Init();
+        return guard;
+    }
+
+    void InitializeHeader() {
+        WritePageGuard header_guard = FetchWrite(HEADER_PAGE_ID);
+        auto *header = header_guard.template AsMut<HeaderPage>();
+        if (header->type_ != PageType::Header) {
+            header->Init();
+        }
+    }
+
+    page_id_t GetRootPageId() {
+        ReadPageGuard header_guard = FetchRead(HEADER_PAGE_ID);
+        return header_guard.template As<HeaderPage>()->root_page_id_;
+    }
+
+    void SetRootPageId(page_id_t root_page_id) {
+        WritePageGuard header_guard = FetchWrite(HEADER_PAGE_ID);
+        header_guard.template AsMut<HeaderPage>()->root_page_id_ = root_page_id;
+    }
+
+    page_id_t AllocatePageId() {
+        WritePageGuard header_guard = FetchWrite(HEADER_PAGE_ID);
+        auto *header = header_guard.template AsMut<HeaderPage>();
+        page_id_t page_id = header->next_page_id_;
+        header->next_page_id_++;
+        return page_id;
+    }
+
+    void AdjustTreeSize(int delta) {
+        WritePageGuard header_guard = FetchWrite(HEADER_PAGE_ID);
+        header_guard.template AsMut<HeaderPage>()->size_ += delta;
+    }
+
+    static int FindChildIndex(const InternalPageType *page, page_id_t child_page_id) {
+        for (int index = 0; index < page->size_; ++index) {
+            if (page->children_[index] == child_page_id) {
+                return index;
+            }
+        }
+        return -1;
+    }
+
+    static int LowerBoundInLeaf(const LeafPageType *page, const KeyPairType &key_pair) {
+        if (page->size_ == 0) {
+            return 0;
+        }
+        int index = page->LowerBound(key_pair);
+        return index < 0 ? 0 : index;
+    }
+
+    static int LowerBoundInLeafByKey(const LeafPageType *page, const KeyType &key) {
+        if (page->size_ == 0) {
+            return 0;
+        }
+        int index = page->LowerBoundByKey(key);
+        return index < 0 ? 0 : index;
+    }
+
+    static int LowerBoundInInternal(const InternalPageType *page, const KeyPairType &key_pair) {
+        if (page->size_ == 0) {
+            return 0;
+        }
+        int index = page->LowerBound(key_pair);
+        return index < 0 ? 0 : index;
+    }
+
+    static int LowerBoundInInternalByKey(const InternalPageType *page, const KeyType &key) {
+        if (page->size_ == 0) {
+            return 0;
+        }
+        int index = page->LowerBoundByKey(key);
+        return index < 0 ? 0 : index;
+    }
+
+    static void InsertIntoLeaf(LeafPageType *page, const KeyPairType &key_pair, int index) {
+        if (page->size_ == 0) {
+            page->data_[0] = key_pair;
+            page->size_ = 1;
+            return;
+        }
+        if (index < page->size_ && page->data_[index] < key_pair) {
+            ++index;
+        }
+        for (int move = page->size_ - 1; move >= index; --move) {
+            page->data_[move + 1] = page->data_[move];
+        }
+        page->data_[index] = key_pair;
+        page->size_++;
+    }
+
+    static void EraseFromLeaf(LeafPageType *page, int index) {
+        for (int move = index; move < page->size_ - 1; ++move) {
+            page->data_[move] = page->data_[move + 1];
+        }
+        page->size_--;
+    }
+
+    static void InsertIntoInternalAfter(InternalPageType *page, int index, const KeyPairType &key_pair,
+                                        page_id_t child_page_id) {
+        for (int move = page->size_ - 1; move > index; --move) {
+            page->data_[move + 1] = page->data_[move];
+            page->children_[move + 1] = page->children_[move];
+        }
+        page->data_[index + 1] = key_pair;
+        page->children_[index + 1] = child_page_id;
+        page->size_++;
+    }
+
+    static void RemoveInternalEntryAt(InternalPageType *page, int index) {
+        for (int move = index; move < page->size_ - 1; ++move) {
+            page->data_[move] = page->data_[move + 1];
+            page->children_[move] = page->children_[move + 1];
+        }
+        page->size_--;
+    }
+
+    void PropagateMaxKeyChange(page_id_t child_page_id, const KeyPairType &new_max) {
+        page_id_t current_child = child_page_id;
+        KeyPairType current_max = new_max;
+        while (current_child != INVALID_PAGE_ID) {
+            WritePageGuard child_guard = FetchWrite(current_child);
+            const PageType child_type = *child_guard.template As<PageType>();
+            page_id_t parent_page_id = INVALID_PAGE_ID;
+            if (child_type == PageType::Leaf) {
+                parent_page_id = child_guard.template As<LeafPageType>()->parent_;
+            } else if (child_type == PageType::Internal) {
+                parent_page_id = child_guard.template As<InternalPageType>()->parent_;
+            }
+            child_guard.Drop();
+            if (parent_page_id == INVALID_PAGE_ID) {
                 break;
             }
-            else {
-                pos_ = cur_->right_;
-                cur_ = buffer_.get_page(pos_);
-                curk = 0;
+            WritePageGuard parent_guard = FetchWrite(parent_page_id);
+            auto *parent = parent_guard.template AsMut<InternalPageType>();
+            int index = FindChildIndex(parent, current_child);
+            if (index < 0) {
+                break;
+            }
+            parent->data_[index] = current_max;
+            if (index != parent->size_ - 1) {
+                break;
+            }
+            current_child = parent_page_id;
+            current_max = parent->Back();
+        }
+    }
+
+    void DescendReadByKey(const KeyType &key, Context &context) {
+        page_id_t root_page_id = GetRootPageId();
+        if (root_page_id == INVALID_PAGE_ID) {
+            return;
+        }
+        ReadPageGuard current_guard = FetchRead(root_page_id);
+        while (*current_guard.template As<PageType>() != PageType::Leaf) {
+            const auto *internal = current_guard.template As<InternalPageType>();
+            int index = LowerBoundInInternalByKey(internal, key);
+            page_id_t child_page_id = internal->children_[index];
+            ReadPageGuard next_guard = FetchRead(child_page_id);
+            current_guard.Drop();
+            current_guard = std::move(next_guard);
+        }
+        context.read_set_.push_back(std::move(current_guard));
+    }
+
+    void DescendWriteByPair(const KeyPairType &key_pair, Context &context) {
+        page_id_t root_page_id = GetRootPageId();
+        if (root_page_id == INVALID_PAGE_ID) {
+            return;
+        }
+        context.write_set_.push_back(FetchWrite(root_page_id));
+        while (*context.write_set_.back().template As<PageType>() != PageType::Leaf) {
+            auto *internal = context.write_set_.back().template AsMut<InternalPageType>();
+            int index = LowerBoundInInternal(internal, key_pair);
+            context.write_set_.push_back(FetchWrite(internal->children_[index]));
+        }
+    }
+
+    void UpdateChildParent(page_id_t child_page_id, page_id_t parent_page_id) {
+        WritePageGuard child_guard = FetchWrite(child_page_id);
+        if (*child_guard.template As<PageType>() == PageType::Leaf) {
+            child_guard.template AsMut<LeafPageType>()->parent_ = parent_page_id;
+        } else {
+            child_guard.template AsMut<InternalPageType>()->parent_ = parent_page_id;
+        }
+    }
+
+    void CreateNewRoot(page_id_t left_page_id, const KeyPairType &left_max, page_id_t right_page_id,
+                       const KeyPairType &right_max) {
+        page_id_t root_page_id = AllocatePageId();
+        WritePageGuard root_guard = NewPage<InternalPageType>(root_page_id);
+        auto *root = root_guard.template AsMut<InternalPageType>();
+        root->size_ = 2;
+        root->data_[0] = left_max;
+        root->data_[1] = right_max;
+        root->children_[0] = left_page_id;
+        root->children_[1] = right_page_id;
+        UpdateChildParent(left_page_id, root_page_id);
+        UpdateChildParent(right_page_id, root_page_id);
+        SetRootPageId(root_page_id);
+    }
+
+    void SplitInternal(Context &context, int level) {
+        WritePageGuard &internal_guard = context.write_set_[level];
+        auto *internal = internal_guard.template AsMut<InternalPageType>();
+        page_id_t internal_page_id = internal_guard.PageId();
+
+        page_id_t new_internal_page_id = AllocatePageId();
+        WritePageGuard new_internal_guard = NewPage<InternalPageType>(new_internal_page_id);
+        auto *new_internal = new_internal_guard.template AsMut<InternalPageType>();
+
+        int move_start = internal->size_ / 2;
+        int move_count = internal->size_ - move_start;
+        for (int index = 0; index < move_count; ++index) {
+            new_internal->data_[index] = internal->data_[move_start + index];
+            new_internal->children_[index] = internal->children_[move_start + index];
+            UpdateChildParent(new_internal->children_[index], new_internal_page_id);
+        }
+        new_internal->size_ = move_count;
+        internal->size_ = move_start;
+
+        new_internal->parent_ = internal->parent_;
+        new_internal->left_sibling_ = internal_page_id;
+        new_internal->right_sibling_ = internal->right_sibling_;
+        if (new_internal->right_sibling_ != INVALID_PAGE_ID) {
+            WritePageGuard right_guard = FetchWrite(new_internal->right_sibling_);
+            right_guard.template AsMut<InternalPageType>()->left_sibling_ = new_internal_page_id;
+        }
+        internal->right_sibling_ = new_internal_page_id;
+
+        KeyPairType left_max = internal->Back();
+        KeyPairType right_max = new_internal->Back();
+        if (internal->parent_ == INVALID_PAGE_ID) {
+            CreateNewRoot(internal_page_id, left_max, new_internal_page_id, right_max);
+            return;
+        }
+
+        WritePageGuard &parent_guard = context.write_set_[level - 1];
+        auto *parent = parent_guard.template AsMut<InternalPageType>();
+        int child_index = FindChildIndex(parent, internal_page_id);
+        parent->data_[child_index] = left_max;
+        InsertIntoInternalAfter(parent, child_index, right_max, new_internal_page_id);
+        if (parent->size_ > static_cast<int>(InternalPageType::MAX_SIZE)) {
+            SplitInternal(context, level - 1);
+        } else if (child_index == parent->size_ - 2) {
+            PropagateMaxKeyChange(parent_guard.PageId(), parent->Back());
+        }
+    }
+
+    void SplitLeaf(Context &context) {
+        WritePageGuard &leaf_guard = context.write_set_.back();
+        auto *leaf = leaf_guard.template AsMut<LeafPageType>();
+        page_id_t leaf_page_id = leaf_guard.PageId();
+
+        page_id_t new_leaf_page_id = AllocatePageId();
+        WritePageGuard new_leaf_guard = NewPage<LeafPageType>(new_leaf_page_id);
+        auto *new_leaf = new_leaf_guard.template AsMut<LeafPageType>();
+
+        int move_start = leaf->size_ / 2;
+        int move_count = leaf->size_ - move_start;
+        for (int index = 0; index < move_count; ++index) {
+            new_leaf->data_[index] = leaf->data_[move_start + index];
+        }
+        new_leaf->size_ = move_count;
+        leaf->size_ = move_start;
+
+        new_leaf->parent_ = leaf->parent_;
+        new_leaf->left_sibling_ = leaf_page_id;
+        new_leaf->right_sibling_ = leaf->right_sibling_;
+        if (new_leaf->right_sibling_ != INVALID_PAGE_ID) {
+            WritePageGuard right_guard = FetchWrite(new_leaf->right_sibling_);
+            right_guard.template AsMut<LeafPageType>()->left_sibling_ = new_leaf_page_id;
+        }
+        leaf->right_sibling_ = new_leaf_page_id;
+
+        KeyPairType left_max = leaf->Back();
+        KeyPairType right_max = new_leaf->Back();
+        if (leaf->parent_ == INVALID_PAGE_ID) {
+            CreateNewRoot(leaf_page_id, left_max, new_leaf_page_id, right_max);
+            return;
+        }
+
+        WritePageGuard &parent_guard = context.write_set_[context.write_set_.size() - 2];
+        auto *parent = parent_guard.template AsMut<InternalPageType>();
+        int child_index = FindChildIndex(parent, leaf_page_id);
+        parent->data_[child_index] = left_max;
+        InsertIntoInternalAfter(parent, child_index, right_max, new_leaf_page_id);
+        if (parent->size_ > static_cast<int>(InternalPageType::MAX_SIZE)) {
+            SplitInternal(context, static_cast<int>(context.write_set_.size()) - 2);
+        } else if (child_index == parent->size_ - 2) {
+            PropagateMaxKeyChange(parent_guard.PageId(), parent->Back());
+        }
+    }
+
+    void RebalanceInternal(page_id_t page_id) {
+        WritePageGuard current_guard = FetchWrite(page_id);
+        auto *current = current_guard.template AsMut<InternalPageType>();
+        if (current->parent_ == INVALID_PAGE_ID) {
+            if (current->size_ == 1) {
+                page_id_t child_page_id = current->children_[0];
+                UpdateChildParent(child_page_id, INVALID_PAGE_ID);
+                SetRootPageId(child_page_id);
+            } else if (current->size_ == 0) {
+                SetRootPageId(INVALID_PAGE_ID);
+            }
+            return;
+        }
+        if (current->size_ >= static_cast<int>(InternalPageType::HALF_SIZE)) {
+            PropagateMaxKeyChange(page_id, current->Back());
+            return;
+        }
+
+        WritePageGuard parent_guard = FetchWrite(current->parent_);
+        auto *parent = parent_guard.template AsMut<InternalPageType>();
+        int index = FindChildIndex(parent, page_id);
+
+        if (index > 0) {
+            WritePageGuard left_guard = FetchWrite(parent->children_[index - 1]);
+            auto *left = left_guard.template AsMut<InternalPageType>();
+            if (left->size_ > static_cast<int>(InternalPageType::HALF_SIZE)) {
+                for (int move = current->size_ - 1; move >= 0; --move) {
+                    current->data_[move + 1] = current->data_[move];
+                    current->children_[move + 1] = current->children_[move];
+                }
+                current->data_[0] = left->data_[left->size_ - 1];
+                current->children_[0] = left->children_[left->size_ - 1];
+                current->size_++;
+                left->size_--;
+                UpdateChildParent(current->children_[0], page_id);
+                parent->data_[index - 1] = left->Back();
+                parent->data_[index] = current->Back();
+                PropagateMaxKeyChange(parent_guard.PageId(), parent->Back());
+                return;
+            }
+        }
+
+        if (index + 1 < parent->size_) {
+            WritePageGuard right_guard = FetchWrite(parent->children_[index + 1]);
+            auto *right = right_guard.template AsMut<InternalPageType>();
+            if (right->size_ > static_cast<int>(InternalPageType::HALF_SIZE)) {
+                current->data_[current->size_] = right->data_[0];
+                current->children_[current->size_] = right->children_[0];
+                current->size_++;
+                UpdateChildParent(current->children_[current->size_ - 1], page_id);
+                for (int move = 0; move < right->size_ - 1; ++move) {
+                    right->data_[move] = right->data_[move + 1];
+                    right->children_[move] = right->children_[move + 1];
+                }
+                right->size_--;
+                parent->data_[index] = current->Back();
+                parent->data_[index + 1] = right->Back();
+                PropagateMaxKeyChange(parent_guard.PageId(), parent->Back());
+                return;
+            }
+        }
+
+        if (index > 0) {
+            WritePageGuard left_guard = FetchWrite(parent->children_[index - 1]);
+            auto *left = left_guard.template AsMut<InternalPageType>();
+            int base = left->size_;
+            for (int move = 0; move < current->size_; ++move) {
+                left->data_[base + move] = current->data_[move];
+                left->children_[base + move] = current->children_[move];
+                UpdateChildParent(current->children_[move], left_guard.PageId());
+            }
+            left->size_ += current->size_;
+            left->right_sibling_ = current->right_sibling_;
+            if (current->right_sibling_ != INVALID_PAGE_ID) {
+                WritePageGuard sibling_guard = FetchWrite(current->right_sibling_);
+                sibling_guard.template AsMut<InternalPageType>()->left_sibling_ = left_guard.PageId();
+            }
+            RemoveInternalEntryAt(parent, index);
+            parent->data_[index - 1] = left->Back();
+            RebalanceInternal(parent_guard.PageId());
+            return;
+        }
+
+        WritePageGuard right_guard = FetchWrite(parent->children_[index + 1]);
+        auto *right = right_guard.template AsMut<InternalPageType>();
+        int base = current->size_;
+        for (int move = 0; move < right->size_; ++move) {
+            current->data_[base + move] = right->data_[move];
+            current->children_[base + move] = right->children_[move];
+            UpdateChildParent(right->children_[move], page_id);
+        }
+        current->size_ += right->size_;
+        current->right_sibling_ = right->right_sibling_;
+        if (right->right_sibling_ != INVALID_PAGE_ID) {
+            WritePageGuard sibling_guard = FetchWrite(right->right_sibling_);
+            sibling_guard.template AsMut<InternalPageType>()->left_sibling_ = page_id;
+        }
+        RemoveInternalEntryAt(parent, index + 1);
+        parent->data_[index] = current->Back();
+        RebalanceInternal(parent_guard.PageId());
+    }
+
+    void RebalanceLeaf(page_id_t page_id) {
+        WritePageGuard current_guard = FetchWrite(page_id);
+        auto *current = current_guard.template AsMut<LeafPageType>();
+        if (current->parent_ == INVALID_PAGE_ID) {
+            if (current->size_ == 0) {
+                SetRootPageId(INVALID_PAGE_ID);
+            }
+            return;
+        }
+        if (current->size_ >= static_cast<int>(LeafPageType::HALF_SIZE)) {
+            PropagateMaxKeyChange(page_id, current->Back());
+            return;
+        }
+
+        WritePageGuard parent_guard = FetchWrite(current->parent_);
+        auto *parent = parent_guard.template AsMut<InternalPageType>();
+        int index = FindChildIndex(parent, page_id);
+
+        if (index > 0) {
+            WritePageGuard left_guard = FetchWrite(parent->children_[index - 1]);
+            auto *left = left_guard.template AsMut<LeafPageType>();
+            if (left->size_ > static_cast<int>(LeafPageType::HALF_SIZE)) {
+                for (int move = current->size_ - 1; move >= 0; --move) {
+                    current->data_[move + 1] = current->data_[move];
+                }
+                current->data_[0] = left->data_[left->size_ - 1];
+                current->size_++;
+                left->size_--;
+                parent->data_[index - 1] = left->Back();
+                parent->data_[index] = current->Back();
+                PropagateMaxKeyChange(parent_guard.PageId(), parent->Back());
+                return;
+            }
+        }
+
+        if (index + 1 < parent->size_) {
+            WritePageGuard right_guard = FetchWrite(parent->children_[index + 1]);
+            auto *right = right_guard.template AsMut<LeafPageType>();
+            if (right->size_ > static_cast<int>(LeafPageType::HALF_SIZE)) {
+                current->data_[current->size_] = right->data_[0];
+                current->size_++;
+                for (int move = 0; move < right->size_ - 1; ++move) {
+                    right->data_[move] = right->data_[move + 1];
+                }
+                right->size_--;
+                parent->data_[index] = current->Back();
+                parent->data_[index + 1] = right->Back();
+                PropagateMaxKeyChange(parent_guard.PageId(), parent->Back());
+                return;
+            }
+        }
+
+        if (index > 0) {
+            WritePageGuard left_guard = FetchWrite(parent->children_[index - 1]);
+            auto *left = left_guard.template AsMut<LeafPageType>();
+            int base = left->size_;
+            for (int move = 0; move < current->size_; ++move) {
+                left->data_[base + move] = current->data_[move];
+            }
+            left->size_ += current->size_;
+            left->right_sibling_ = current->right_sibling_;
+            if (current->right_sibling_ != INVALID_PAGE_ID) {
+                WritePageGuard sibling_guard = FetchWrite(current->right_sibling_);
+                sibling_guard.template AsMut<LeafPageType>()->left_sibling_ = left_guard.PageId();
+            }
+            RemoveInternalEntryAt(parent, index);
+            parent->data_[index - 1] = left->Back();
+            RebalanceInternal(parent_guard.PageId());
+            return;
+        }
+
+        WritePageGuard right_guard = FetchWrite(parent->children_[index + 1]);
+        auto *right = right_guard.template AsMut<LeafPageType>();
+        int base = current->size_;
+        for (int move = 0; move < right->size_; ++move) {
+            current->data_[base + move] = right->data_[move];
+        }
+        current->size_ += right->size_;
+        current->right_sibling_ = right->right_sibling_;
+        if (right->right_sibling_ != INVALID_PAGE_ID) {
+            WritePageGuard sibling_guard = FetchWrite(right->right_sibling_);
+            sibling_guard.template AsMut<LeafPageType>()->left_sibling_ = page_id;
+        }
+        RemoveInternalEntryAt(parent, index + 1);
+        parent->data_[index] = current->Back();
+        RebalanceInternal(parent_guard.PageId());
+    }
+
+    void InsertPessimistic(const KeyPairType &key_pair) {
+        std::unique_lock<std::shared_mutex> lock(tree_latch_);
+        page_id_t root_page_id = GetRootPageId();
+        if (root_page_id == INVALID_PAGE_ID) {
+            page_id_t new_root_page_id = AllocatePageId();
+            WritePageGuard root_guard = NewPage<LeafPageType>(new_root_page_id);
+            auto *root = root_guard.template AsMut<LeafPageType>();
+            root->data_[0] = key_pair;
+            root->size_ = 1;
+            SetRootPageId(new_root_page_id);
+            AdjustTreeSize(1);
+            return;
+        }
+
+        Context context;
+        DescendWriteByPair(key_pair, context);
+        auto *leaf = context.write_set_.back().template AsMut<LeafPageType>();
+        int index = LowerBoundInLeaf(leaf, key_pair);
+        if (index < leaf->size_ && leaf->data_[index] == key_pair) {
+            return;
+        }
+        KeyPairType old_max = leaf->size_ > 0 ? leaf->Back() : key_pair;
+        InsertIntoLeaf(leaf, key_pair, index);
+        AdjustTreeSize(1);
+        if (leaf->size_ > static_cast<int>(LeafPageType::MAX_SIZE)) {
+            SplitLeaf(context);
+            return;
+        }
+        if (!(leaf->Back() == old_max)) {
+            PropagateMaxKeyChange(context.write_set_.back().PageId(), leaf->Back());
+        }
+    }
+
+    void ErasePessimistic(const KeyPairType &key_pair) {
+        std::unique_lock<std::shared_mutex> lock(tree_latch_);
+        page_id_t root_page_id = GetRootPageId();
+        if (root_page_id == INVALID_PAGE_ID) {
+            return;
+        }
+
+        Context context;
+        DescendWriteByPair(key_pair, context);
+        auto *leaf = context.write_set_.back().template AsMut<LeafPageType>();
+        int index = LowerBoundInLeaf(leaf, key_pair);
+        if (index >= leaf->size_ || !(leaf->data_[index] == key_pair)) {
+            return;
+        }
+        KeyPairType old_max = leaf->Back();
+        EraseFromLeaf(leaf, index);
+        AdjustTreeSize(-1);
+        if (leaf->parent_ == INVALID_PAGE_ID) {
+            if (leaf->size_ == 0) {
+                SetRootPageId(INVALID_PAGE_ID);
+            }
+            return;
+        }
+        if (leaf->size_ == 0 || leaf->size_ < static_cast<int>(LeafPageType::HALF_SIZE)) {
+            RebalanceLeaf(context.write_set_.back().PageId());
+            return;
+        }
+        if (!(leaf->Back() == old_max)) {
+            PropagateMaxKeyChange(context.write_set_.back().PageId(), leaf->Back());
+        }
+    }
+
+public:
+    explicit BPlusTree(const std::string &file_name = "bpt.dat") : buffer_(CACHE_CAPACITY, file_name) {
+        InitializeHeader();
+    }
+
+    ~BPlusTree() = default;
+
+    std::optional<ValueType> find(const KeyType &key) {
+        std::shared_lock<std::shared_mutex> lock(tree_latch_);
+        Context context;
+        DescendReadByKey(key, context);
+        if (context.read_set_.empty()) {
+            return std::nullopt;
+        }
+        const auto *leaf = context.read_set_.back().template As<LeafPageType>();
+        int index = LowerBoundInLeafByKey(leaf, key);
+        if (index >= leaf->size_ || !KeyEqualValue(leaf->data_[index].key_, key)) {
+            return std::nullopt;
+        }
+        return leaf->data_[index].val_;
+    }
+
+    void find_all(const KeyType &key, std::vector<ValueType> &vec) {
+        std::shared_lock<std::shared_mutex> lock(tree_latch_);
+        vec.clear();
+        Context context;
+        DescendReadByKey(key, context);
+        if (context.read_set_.empty()) {
+            return;
+        }
+
+        ReadPageGuard current_guard = std::move(context.read_set_.back());
+        context.read_set_.pop_back();
+        while (current_guard.IsValid()) {
+            const auto *leaf = current_guard.template As<LeafPageType>();
+            int index = LowerBoundInLeafByKey(leaf, key);
+            while (index < leaf->size_ && KeyEqualValue(leaf->data_[index].key_, key)) {
+                vec.push_back(leaf->data_[index].val_);
+                ++index;
+            }
+            if (index < leaf->size_ || leaf->right_sibling_ == INVALID_PAGE_ID) {
+                break;
+            }
+            page_id_t next_page_id = leaf->right_sibling_;
+            current_guard.Drop();
+            current_guard = FetchRead(next_page_id);
+            const auto *next_leaf = current_guard.template As<LeafPageType>();
+            if (next_leaf->size_ == 0 || !KeyEqualValue(next_leaf->data_[0].key_, key)) {
+                break;
             }
         }
     }
-}
 
-BPT_TEMPLATE_ARGS
-void BPT_TYPE::split() {
-    PAGE_TYPE newp;
-    newp.size_ = PAGE_SLOT_COUNT / 2;
-    auto cur_mut = buffer_.get_page_mutable(pos_);
-    diskpos_t cur_pos = pos_;
-    diskpos_t parent_pos = cur_mut->fa_;
-    cur_mut->size_ = PAGE_SLOT_COUNT / 2;
-    if (cur_mut->type_ == PageType::Leaf) {
-        newp.type_ = PageType::Leaf;
-    }
-    else {
-        newp.type_ = PageType::Internal;
-    }
-    newp.fa_ = parent_pos;
-    newp.left_ = cur_pos;
-    newp.right_ = cur_mut->right_;
-    if (cur_mut->type_ == PageType::Leaf) {
-        for (int i = 0; i < newp.size_; i++) {
-            newp.data_[i] = cur_mut->data_[i + newp.size_];
-        }
-        KEYPAIR_TYPE split_at = cur_mut->back();
-        KEYPAIR_TYPE max_pair = newp.back();
-        if (parent_pos != -1) {
-            auto f = buffer_.get_page_mutable(parent_pos);
-            diskpos_t fa_pos = f->lower_bound(max_pair);
-            for (int i = f->size_ - 1; i >= fa_pos; i--) {
-                f->data_[i + 1] = f->data_[i];
-                f->ch_[i + 1] = f->ch_[i];
-            }
-            diskpos_t newp_pos = buffer_.insert_page(newp);
-            f->data_[fa_pos] = split_at;
-            f->data_[fa_pos + 1] = max_pair;
-            f->ch_[fa_pos] = cur_pos;
-            f->ch_[fa_pos + 1] = newp_pos;
-            f->size_++;
-            if (cur_mut->right_ != -1) {
-                auto rp = buffer_.get_page_mutable(cur_mut->right_);
-                rp->left_ = newp_pos;
-                buffer_.finish_use(cur_mut->right_);
-            }
-            cur_mut->right_ = newp_pos;
-            bool need_split_parent = (f->size_ == PAGE_SLOT_COUNT);
-            buffer_.finish_use(parent_pos);
-            buffer_.finish_use(cur_pos);
-            if (need_split_parent) {
-                pos_ = parent_pos;
-                split();
-            }
-        }
-        else {
-            PAGE_TYPE newr;
-            newr.type_ = PageType::Internal;
-            newr.size_ = 2;
-            newr.data_[0] = split_at;
-            newr.data_[1] = max_pair;
-            newr.ch_[0] = cur_pos;
-            diskpos_t newp_pos = buffer_.insert_page(newp);
-            newr.ch_[1] = newp_pos;
-            cur_mut->right_ = newp_pos;
-            root_ = buffer_.insert_page(newr);
-            cur_mut->fa_ = root_;
-            auto newp_mut = buffer_.get_page_mutable(newp_pos);
-            newp_mut->fa_ = root_;
-            buffer_.finish_use(newp_pos);
-            buffer_.finish_use(cur_pos);
-        }
-        return;
+    void insert(const KeyType &key, const ValueType &value) {
+        KeyPairType key_pair(key, value);
+        InsertPessimistic(key_pair);
     }
 
-    diskpos_t newp_pos = buffer_.insert_page(newp);
-    auto newp_mut = buffer_.get_page_mutable(newp_pos);
-    for (int i = 0; i < newp_mut->size_; i++) {
-        newp_mut->data_[i] = cur_mut->data_[i + newp_mut->size_];
-        newp_mut->ch_[i] = cur_mut->ch_[i + newp_mut->size_];
+    void erase(const KeyType &key, const ValueType &value) {
+        KeyPairType key_pair(key, value);
+        ErasePessimistic(key_pair);
     }
-    for (int i = 0; i < newp_mut->size_; i++) {
-        auto ch = buffer_.get_page_mutable(newp_mut->ch_[i]);
-        ch->fa_ = newp_pos;
-        buffer_.finish_use(newp_mut->ch_[i]);
-    }
-    KEYPAIR_TYPE split_at = cur_mut->back();
-    KEYPAIR_TYPE max_pair = newp_mut->back();
-    if (parent_pos != -1) {
-        auto f = buffer_.get_page_mutable(parent_pos);
-        diskpos_t fa_pos = f->lower_bound(max_pair);
-        for (int i = f->size_ - 1; i >= fa_pos; i--) {
-            f->data_[i + 1] = f->data_[i];
-            f->ch_[i + 1] = f->ch_[i];
-        }
-        f->data_[fa_pos] = split_at;
-        f->data_[fa_pos + 1] = max_pair;
-        f->ch_[fa_pos] = cur_pos;
-        f->ch_[fa_pos + 1] = newp_pos;
-        f->size_++;
-        if (cur_mut->right_ != -1) {
-            auto rp = buffer_.get_page_mutable(cur_mut->right_);
-            rp->left_ = newp_pos;
-            buffer_.finish_use(cur_mut->right_);
-        }
-        cur_mut->right_ = newp_pos;
-        bool need_split_parent = (f->size_ == PAGE_SLOT_COUNT);
-        buffer_.finish_use(parent_pos);
-        buffer_.finish_use(cur_pos);
-        buffer_.finish_use(newp_pos);
-        if (need_split_parent) {
-            pos_ = parent_pos;
-            split();
-        }
-    }
-    else {
-        PAGE_TYPE newr;
-        newr.type_ = PageType::Internal;
-        newr.size_ = 2;
-        newr.data_[0] = split_at;
-        newr.data_[1] = max_pair;
-        newr.ch_[0] = cur_pos;
-        newr.ch_[1] = newp_pos;
-        root_ = buffer_.insert_page(newr);
-        cur_mut->fa_ = root_;
-        newp_mut->fa_ = root_;
-        buffer_.finish_use(cur_pos);
-        buffer_.finish_use(newp_pos);
-    }
-}
-
-BPT_TEMPLATE_ARGS
-void BPT_TYPE::insert(const KeyType& key, const ValueType& val) {
-    KEYPAIR_TYPE kp(key, val);
-    if (root_ == 0) {
-        PAGE_TYPE newr;
-        newr.size_ = 1;
-        newr.type_ = PageType::Leaf;
-        newr.data_[0] = kp;
-        root_ = buffer_.insert_page(newr);
-        return;
-    }
-    pos_ = root_;
-    cur_ = buffer_.get_page(pos_);
-    while (cur_->type_ != PageType::Leaf) {
-        auto cur_mut = buffer_.get_page_mutable(pos_);
-        int k = cur_mut->lower_bound(kp);
-        if (cur_mut->data_[k] < kp) {
-            cur_mut->data_[k] = kp;
-        }
-        diskpos_t child = cur_mut->ch_[k];
-        buffer_.finish_use(pos_);
-        pos_ = child;
-        cur_ = buffer_.get_page(pos_);
-    }
-    auto cur_mut = buffer_.get_page_mutable(pos_);
-    int k = cur_mut->lower_bound(kp);
-    if (cur_mut->data_[k] == kp) {
-        buffer_.finish_use(pos_);
-        return;
-    }
-    if (cur_mut->data_[k] < kp) {
-        cur_mut->data_[k + 1] = kp;
-        cur_mut->size_++;
-    }
-    else {
-        for (int i = static_cast<int>(cur_mut->size_) - 1; i >= k; i--) {
-            cur_mut->data_[i + 1] = cur_mut->data_[i];
-        }
-        cur_mut->data_[k] = kp;
-        cur_mut->size_++;
-    }
-    bool need_split = (cur_mut->size_ == PAGE_SLOT_COUNT);
-    buffer_.finish_use(pos_);
-    if (need_split) {
-        split();
-    }
-}
-
-BPT_TEMPLATE_ARGS
-void BPT_TYPE::erase(const KeyType& key, const ValueType& val) {
-    if (root_ == 0) {
-        return;
-    }
-    KEYPAIR_TYPE kp(key, val);
-    pos_ = root_;
-    cur_ = buffer_.get_page(pos_);
-    while (cur_->type_ != PageType::Leaf) {
-        int k = cur_->lower_bound(kp);
-        pos_ = cur_->ch_[k];
-        cur_ = buffer_.get_page(pos_);
-    }
-    auto cur_mut = buffer_.get_page_mutable(pos_);
-    int k = cur_mut->lower_bound(kp);
-    if (cur_mut->data_[k] != kp) {
-        buffer_.finish_use(pos_);
-        return;
-    }
-    for (int i = k; i < static_cast<int>(cur_mut->size_) - 1; i++) {
-        cur_mut->data_[i] = cur_mut->data_[i + 1];
-    }
-    cur_mut->size_--;
-    KEYPAIR_TYPE max_pair = cur_mut->back();
-    diskpos_t cur_pos = pos_;
-    diskpos_t fpos = cur_mut->fa_;
-    buffer_.finish_use(cur_pos);
-    while (fpos != -1) {
-        auto f = buffer_.get_page_mutable(fpos);
-        int p = f->lower_bound(kp);
-        diskpos_t next_parent = f->fa_;
-        if (f->data_[p] == kp) {
-            f->data_[p] = max_pair;
-            buffer_.finish_use(fpos);
-            fpos = next_parent;
-        }
-        else {
-            buffer_.finish_use(fpos);
-            break;
-        }
-    }
-    auto check_cur = buffer_.get_page(pos_);
-    bool need_balance = (check_cur->size_ < PAGE_SLOT_COUNT / 2);
-    if (need_balance) {
-        balance();
-    }
-}
-
-BPT_TEMPLATE_ARGS
-bool BPT_TYPE::borrowl() {
-    auto cur_mut = buffer_.get_page_mutable(pos_);
-    diskpos_t cur_pos = pos_;
-    if (cur_mut->fa_ == -1 || cur_mut->size_ == 0) {
-        buffer_.finish_use(cur_pos);
-        return false;
-    }
-    diskpos_t fpos = cur_mut->fa_;
-    KEYPAIR_TYPE max_pair = cur_mut->back();
-    auto f = buffer_.get_page_mutable(fpos);
-    int k = f->lower_bound(max_pair);
-    if (k == 0) {
-        buffer_.finish_use(fpos);
-        buffer_.finish_use(cur_pos);
-        return false;
-    }
-    diskpos_t bpos = f->ch_[k - 1];
-    auto bro = buffer_.get_page_mutable(bpos);
-    if (bro->size_ <= PAGE_SLOT_COUNT / 2) {
-        buffer_.finish_use(bpos);
-        buffer_.finish_use(fpos);
-        buffer_.finish_use(cur_pos);
-        return false;
-    }
-    for (int i = static_cast<int>(cur_mut->size_) - 1; i >= 0; i--) {
-        cur_mut->data_[i + 1] = cur_mut->data_[i];
-        cur_mut->ch_[i + 1] = cur_mut->ch_[i];
-    }
-    cur_mut->data_[0] = bro->back();
-    cur_mut->ch_[0] = bro->ch_[bro->size_ - 1];
-    cur_mut->size_++;
-    bro->size_--;
-    if (cur_mut->type_ == PageType::Internal) {
-        auto son = buffer_.get_page_mutable(cur_mut->ch_[0]);
-        son->fa_ = cur_pos;
-        buffer_.finish_use(cur_mut->ch_[0]);
-    }
-    f->data_[k - 1] = bro->back();
-    buffer_.finish_use(bpos);
-    buffer_.finish_use(fpos);
-    buffer_.finish_use(cur_pos);
-    return true;
-}
-
-BPT_TEMPLATE_ARGS
-bool BPT_TYPE::borrowr() {
-    auto cur_mut = buffer_.get_page_mutable(pos_);
-    diskpos_t cur_pos = pos_;
-    if (cur_mut->fa_ == -1 || cur_mut->size_ == 0) {
-        buffer_.finish_use(cur_pos);
-        return false;
-    }
-    diskpos_t fpos = cur_mut->fa_;
-    KEYPAIR_TYPE max_pair = cur_mut->back();
-    auto f = buffer_.get_page_mutable(fpos);
-    int k = f->lower_bound(max_pair);
-    if (k == static_cast<int>(f->size_) - 1) {
-        buffer_.finish_use(fpos);
-        buffer_.finish_use(cur_pos);
-        return false;
-    }
-    diskpos_t bpos = f->ch_[k + 1];
-    auto bro = buffer_.get_page_mutable(bpos);
-    if (bro->size_ <= PAGE_SLOT_COUNT / 2) {
-        buffer_.finish_use(bpos);
-        buffer_.finish_use(fpos);
-        buffer_.finish_use(cur_pos);
-        return false;
-    }
-    cur_mut->data_[cur_mut->size_] = bro->data_[0];
-    cur_mut->ch_[cur_mut->size_] = bro->ch_[0];
-    cur_mut->size_++;
-    for (int i = 0; i < static_cast<int>(bro->size_) - 1; i++) {
-        bro->data_[i] = bro->data_[i + 1];
-        bro->ch_[i] = bro->ch_[i + 1];
-    }
-    bro->size_--;
-    if (cur_mut->type_ == PageType::Internal) {
-        auto son = buffer_.get_page_mutable(cur_mut->ch_[cur_mut->size_ - 1]);
-        son->fa_ = cur_pos;
-        buffer_.finish_use(cur_mut->ch_[cur_mut->size_ - 1]);
-    }
-    f->data_[k] = cur_mut->back();
-    buffer_.finish_use(bpos);
-    buffer_.finish_use(fpos);
-    buffer_.finish_use(cur_pos);
-    return true;
-}
-
-BPT_TEMPLATE_ARGS
-void BPT_TYPE::merge() {
-    auto cur_mut = buffer_.get_page_mutable(pos_);
-    diskpos_t cur_pos = pos_;
-    if (cur_mut->fa_ == -1) {
-        buffer_.finish_use(cur_pos);
-        return;
-    }
-    KEYPAIR_TYPE max_pair = cur_mut->back();
-    diskpos_t fpos = cur_mut->fa_;
-    auto f = buffer_.get_page_mutable(fpos);
-    int k = f->lower_bound(max_pair);
-    if (k) {
-        diskpos_t bpos = f->ch_[k - 1];
-        auto bro = buffer_.get_page_mutable(bpos);
-        if (cur_mut->type_ == PageType::Internal) {
-            for (int i = 0; i < static_cast<int>(cur_mut->size_); i++) {
-                auto son = buffer_.get_page_mutable(cur_mut->ch_[i]);
-                son->fa_ = bpos;
-                buffer_.finish_use(cur_mut->ch_[i]);
-            }
-        }
-        for (int i = 0; i < static_cast<int>(cur_mut->size_); i++) {
-            bro->data_[bro->size_ + i] = cur_mut->data_[i];
-            bro->ch_[bro->size_ + i] = cur_mut->ch_[i];
-        }
-        bro->size_ += cur_mut->size_;
-        cur_mut->size_ = 0;
-        bro->right_ = cur_mut->right_;
-        if (cur_mut->right_ != -1) {
-            auto rp = buffer_.get_page_mutable(cur_mut->right_);
-            rp->left_ = bpos;
-            buffer_.finish_use(cur_mut->right_);
-        }
-        for (int i = k; i < static_cast<int>(f->size_) - 1; i++) {
-            f->data_[i] = f->data_[i + 1];
-            f->ch_[i] = f->ch_[i + 1];
-        }
-        f->size_--;
-        f->data_[k - 1] = bro->back();
-        bool need_balance = (f->size_ < PAGE_SLOT_COUNT / 2);
-        buffer_.finish_use(bpos);
-        buffer_.finish_use(fpos);
-        buffer_.finish_use(cur_pos);
-        if (need_balance) {
-            pos_ = fpos;
-            balance();
-        }
-    }
-    else if (k != static_cast<int>(f->size_) - 1) {
-        diskpos_t bpos = f->ch_[k + 1];
-        auto bro = buffer_.get_page_mutable(bpos);
-        if (cur_mut->type_ == PageType::Internal) {
-            for (int i = 0; i < static_cast<int>(bro->size_); i++) {
-                auto son = buffer_.get_page_mutable(bro->ch_[i]);
-                son->fa_ = cur_pos;
-                buffer_.finish_use(bro->ch_[i]);
-            }
-        }
-        for (int i = 0; i < static_cast<int>(bro->size_); i++) {
-            cur_mut->data_[cur_mut->size_ + i] = bro->data_[i];
-            cur_mut->ch_[cur_mut->size_ + i] = bro->ch_[i];
-        }
-        cur_mut->size_ += bro->size_;
-        bro->size_ = 0;
-        cur_mut->right_ = bro->right_;
-        if (bro->right_ != -1) {
-            auto rp = buffer_.get_page_mutable(bro->right_);
-            rp->left_ = cur_pos;
-            buffer_.finish_use(bro->right_);
-        }
-        for (int i = k + 1; i < static_cast<int>(f->size_) - 1; i++) {
-            f->data_[i] = f->data_[i + 1];
-            f->ch_[i] = f->ch_[i + 1];
-        }
-        f->size_--;
-        f->data_[k] = cur_mut->back();
-        bool need_balance = (f->size_ < PAGE_SLOT_COUNT / 2);
-        buffer_.finish_use(bpos);
-        buffer_.finish_use(fpos);
-        buffer_.finish_use(cur_pos);
-        if (need_balance) {
-            pos_ = fpos;
-            balance();
-        }
-    }
-    else {
-        buffer_.finish_use(fpos);
-        buffer_.finish_use(cur_pos);
-    }
-}
-
-BPT_TEMPLATE_ARGS
-void BPT_TYPE::balance() {
-    auto cur_mut = buffer_.get_page_mutable(pos_);
-    diskpos_t cur_pos = pos_;
-    if (cur_mut->fa_ == -1) {
-        if (cur_mut->size_ == 0) {
-            root_ = 0;
-        }
-        if (cur_mut->type_ == PageType::Internal && cur_mut->size_ == 1) {
-            diskpos_t child = cur_mut->ch_[0];
-            auto son = buffer_.get_page_mutable(child);
-            son->fa_ = -1;
-            buffer_.finish_use(child);
-            root_ = child;
-        }
-        buffer_.finish_use(cur_pos);
-        return;
-    }
-    buffer_.finish_use(cur_pos);
-    if (borrowl()) {
-        return;
-    }
-    if (borrowr()) {
-        return;
-    }
-    merge();
-}
+};
 
 } // namespace sjtu
 

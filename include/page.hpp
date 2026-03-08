@@ -1,175 +1,235 @@
 #ifndef PAGE_HPP
 #define PAGE_HPP
 
+#include <cstring>
+#include <algorithm>
+
 #include "config.hpp"
 #include "comparator.hpp"
 #include "type_helper.hpp"
 
 namespace sjtu {
-#define KEYPAIR_TYPE KeyPair<KeyType, ValueType>
-#define KEYPAIR_TEMPLATE_ARGS template<typename KeyType, typename ValueType>
 
-#define PAGE_TYPE Page<KeyType, ValueType>
-#define PAGE_TEMPLATE_ARGS template<typename KeyType, typename ValueType>
+// ======================== KeyPair ========================
 
-KEYPAIR_TEMPLATE_ARGS
+template<typename KeyType, typename ValueType>
 struct KeyPair {
     KeyType key_;
     ValueType val_;
 
     KeyPair() = default;
-
     KeyPair(const KeyPair&) = default;
-
     KeyPair(const KeyType& key, const ValueType& val) : key_(key), val_(val) {}
-
     ~KeyPair() = default;
-
-    KeyPair& operator=(const KeyPair& oth) = default;
+    KeyPair& operator=(const KeyPair&) = default;
 };
 
-KEYPAIR_TEMPLATE_ARGS
-bool operator==(const KEYPAIR_TYPE& a, const KEYPAIR_TYPE& b) {
+template<typename KeyType, typename ValueType>
+bool operator==(const KeyPair<KeyType, ValueType>& a, const KeyPair<KeyType, ValueType>& b) {
     if constexpr (has_operator_equal_v<KeyType> && has_operator_equal_v<ValueType>) {
         return a.key_ == b.key_ && a.val_ == b.val_;
-    }
-    else {
-        Comparator<KeyType> key_comp;
-        Comparator<ValueType> val_comp;
-        return key_comp(a.key_, b.key_) == 0 && val_comp(a.val_, b.val_) == 0;
-    }
-}
-
-KEYPAIR_TEMPLATE_ARGS
-bool operator!=(const KEYPAIR_TYPE& a, const KEYPAIR_TYPE& b) {
-    return !(a == b);
-}
-
-KEYPAIR_TEMPLATE_ARGS
-bool operator>(const KEYPAIR_TYPE& a, const KEYPAIR_TYPE& b) {
-    if constexpr (has_operator_greater_v<KeyType> && has_operator_greater_v<ValueType>) {
-        if (a.key_ == b.key_) {
-            return a.val_ > b.val_;
-        }
-        return a.key_ > b.key_;
     } else {
-        Comparator<KeyType> key_comp;
-        Comparator<ValueType> val_comp;
-        int k = key_comp(a.key_, b.key_);
-        if (k == 0) return val_comp(a.val_, b.val_) > 0;
-        return k > 0;
+        Comparator<KeyType> kc; Comparator<ValueType> vc;
+        return kc(a.key_, b.key_) == 0 && vc(a.val_, b.val_) == 0;
     }
 }
+template<typename KeyType, typename ValueType>
+bool operator!=(const KeyPair<KeyType, ValueType>& a, const KeyPair<KeyType, ValueType>& b) { return !(a == b); }
 
-KEYPAIR_TEMPLATE_ARGS
-bool operator<(const KEYPAIR_TYPE& a, const KEYPAIR_TYPE& b) {
+template<typename KeyType, typename ValueType>
+bool operator<(const KeyPair<KeyType, ValueType>& a, const KeyPair<KeyType, ValueType>& b) {
     if constexpr (has_operator_less_v<KeyType> && has_operator_less_v<ValueType>) {
-        if (a.key_ == b.key_) {
-            return a.val_ < b.val_;
-        }
+        if (a.key_ == b.key_) return a.val_ < b.val_;
         return a.key_ < b.key_;
     } else {
-        Comparator<KeyType> key_comp;
-        Comparator<ValueType> val_comp;
-        int k = key_comp(a.key_, b.key_);
-        if (k == 0) return val_comp(a.val_, b.val_) < 0;
+        Comparator<KeyType> kc; Comparator<ValueType> vc;
+        int k = kc(a.key_, b.key_);
+        if (k == 0) return vc(a.val_, b.val_) < 0;
         return k < 0;
     }
 }
+template<typename KeyType, typename ValueType>
+bool operator>(const KeyPair<KeyType, ValueType>& a, const KeyPair<KeyType, ValueType>& b) {
+    if constexpr (has_operator_greater_v<KeyType> && has_operator_greater_v<ValueType>) {
+        if (a.key_ == b.key_) return a.val_ > b.val_;
+        return a.key_ > b.key_;
+    } else {
+        Comparator<KeyType> kc; Comparator<ValueType> vc;
+        int k = kc(a.key_, b.key_);
+        if (k == 0) return vc(a.val_, b.val_) > 0;
+        return k > 0;
+    }
+}
+template<typename K, typename V>
+bool operator>=(const KeyPair<K, V>& a, const KeyPair<K, V>& b) { return !(a < b); }
+template<typename K, typename V>
+bool operator<=(const KeyPair<K, V>& a, const KeyPair<K, V>& b) { return !(a > b); }
 
-KEYPAIR_TEMPLATE_ARGS
-bool operator>=(const KEYPAIR_TYPE& a, const KEYPAIR_TYPE& b) {
-    return !(a < b);
+template<typename KeyType, typename ValueType>
+bool key_less(const KeyPair<KeyType, ValueType>& a, const KeyType& key) {
+    if constexpr (has_operator_less_v<KeyType>) {
+        return a.key_ < key;
+    } else {
+        Comparator<KeyType> comp;
+        return comp(a.key_, key) < 0;
+    }
 }
 
-KEYPAIR_TEMPLATE_ARGS
-bool operator<=(const KEYPAIR_TYPE& a, const KEYPAIR_TYPE& b) {
-    return !(a > b);
+template<typename KeyType>
+bool key_equal(const KeyType& a, const KeyType& b) {
+    if constexpr (has_operator_equal_v<KeyType>) {
+        return a == b;
+    } else {
+        Comparator<KeyType> comp;
+        return comp(a, b) == 0;
+    }
 }
 
-enum class PageType {
+// ======================== Page Types ========================
+
+enum class PageType : int32_t {
     Invalid = 0,
-    Leaf,
-    Internal
+    Header,
+    Internal,
+    Leaf
 };
 
-PAGE_TEMPLATE_ARGS
-struct Page {
-    KEYPAIR_TYPE data_[PAGE_SLOT_COUNT + 2];
-    diskpos_t ch_[PAGE_SLOT_COUNT + 2];
-    PageType type_ = PageType::Invalid;
-    diskpos_t fa_ = -1;
-    diskpos_t left_ = -1;
-    diskpos_t right_ = -1;
-    size_t size_ = 0;
+// ======================== HeaderPage ========================
 
-    Page() = default;
+struct HeaderPage {
+    PageType type_ = PageType::Header;
+    page_id_t root_page_id_ = INVALID_PAGE_ID;
+    page_id_t next_page_id_ = 1;
+    int32_t size_ = 0;
 
-    Page(const Page&) = default;
-
-    ~Page() = default;
-
-    int lower_bound(const KEYPAIR_TYPE& kp) const;
-
-    int lower_bound(const KeyType& key) const;
-
-    KEYPAIR_TYPE front() const;
-
-    KEYPAIR_TYPE back() const;
-
+    void Init() {
+        type_ = PageType::Header;
+        root_page_id_ = INVALID_PAGE_ID;
+        next_page_id_ = 1;
+        size_ = 0;
+    }
 };
 
-PAGE_TEMPLATE_ARGS
-int PAGE_TYPE::lower_bound(const KEYPAIR_TYPE& kp) const {
-    int l = 0, r = size_ - 1, mid = -1, ans = r;
-    while (l <= r) {
-        mid = (l + r) / 2;
-        if (data_[mid] < kp) {
-            l = mid + 1;
-        }
-        else {
-            ans = mid;
-            r = mid - 1;
-        }
-    }
-    return ans;
-}
+static_assert(sizeof(HeaderPage) <= PAGE_SIZE);
 
-PAGE_TEMPLATE_ARGS
-int PAGE_TYPE::lower_bound(const KeyType& key) const {
-    int l = 0, r = size_ - 1, mid = -1, ans = r;
-    while (l <= r) {
-        mid = (l + r) / 2;
-        if (data_[mid].key_ < key) {
-            l = mid + 1;
-        }
-        else {
-            ans = mid;
-            r = mid - 1;
-        }
-    }
-    return ans;
-}
+// ======================== InternalPage ========================
+// Stores KeyPair as routing keys (max of each subtree) + child page_ids.
+// data_[i] = max KeyPair of the subtree rooted at children_[i].
 
-PAGE_TEMPLATE_ARGS
-KEYPAIR_TYPE PAGE_TYPE::front() const {
-    if (!size_) {
-        return KEYPAIR_TYPE();
-    }
-    else {
-        return data_[0];
-    }
-}
+template<typename KeyType, typename ValueType>
+struct InternalPage {
+    PageType type_ = PageType::Internal;
+    int32_t size_ = 0;
+    page_id_t parent_ = INVALID_PAGE_ID;
+    page_id_t left_sibling_ = INVALID_PAGE_ID;
+    page_id_t right_sibling_ = INVALID_PAGE_ID;
 
-PAGE_TEMPLATE_ARGS
-KEYPAIR_TYPE PAGE_TYPE::back() const {
-    if (!size_) {
-        return KEYPAIR_TYPE();
+    static constexpr size_t HEADER_SIZE = sizeof(PageType) + sizeof(int32_t) * 4;
+    static constexpr size_t MAX_SIZE =
+        (PAGE_SIZE - HEADER_SIZE) / (sizeof(KeyPair<KeyType, ValueType>) + sizeof(page_id_t)) - 1;
+    static constexpr size_t HALF_SIZE = MAX_SIZE / 2;
+
+    KeyPair<KeyType, ValueType> data_[MAX_SIZE + 1];
+    page_id_t children_[MAX_SIZE + 1];
+
+    void Init() {
+        type_ = PageType::Internal;
+        size_ = 0;
+        parent_ = INVALID_PAGE_ID;
+        left_sibling_ = INVALID_PAGE_ID;
+        right_sibling_ = INVALID_PAGE_ID;
     }
-    else {
-        return data_[size_ - 1];
+
+    int LowerBound(const KeyPair<KeyType, ValueType>& kp) const {
+        if (size_ <= 0) {
+            return 0;
+        }
+        int lo = 0, hi = size_ - 1, ans = hi;
+        while (lo <= hi) {
+            int mid = (lo + hi) / 2;
+            if (data_[mid] < kp) lo = mid + 1;
+            else { ans = mid; hi = mid - 1; }
+        }
+        return ans;
     }
-}
+
+    int LowerBoundByKey(const KeyType& key) const {
+        if (size_ <= 0) {
+            return 0;
+        }
+        int lo = 0, hi = size_ - 1, ans = hi;
+        while (lo <= hi) {
+            int mid = (lo + hi) / 2;
+            if (key_less(data_[mid], key)) lo = mid + 1;
+            else { ans = mid; hi = mid - 1; }
+        }
+        return ans;
+    }
+
+    KeyPair<KeyType, ValueType> Back() const {
+        return size_ ? data_[size_ - 1] : KeyPair<KeyType, ValueType>();
+    }
+};
+
+// ======================== LeafPage ========================
+// Stores KeyPair data only, plus sibling links for range scan.
+
+template<typename KeyType, typename ValueType>
+struct LeafPage {
+    PageType type_ = PageType::Leaf;
+    int32_t size_ = 0;
+    page_id_t parent_ = INVALID_PAGE_ID;
+    page_id_t left_sibling_ = INVALID_PAGE_ID;
+    page_id_t right_sibling_ = INVALID_PAGE_ID;
+
+    static constexpr size_t HEADER_SIZE = sizeof(PageType) + sizeof(int32_t) * 4;
+    static constexpr size_t MAX_SIZE =
+        (PAGE_SIZE - HEADER_SIZE) / sizeof(KeyPair<KeyType, ValueType>) - 1;
+    static constexpr size_t HALF_SIZE = MAX_SIZE / 2;
+
+    KeyPair<KeyType, ValueType> data_[MAX_SIZE + 1];
+
+    void Init() {
+        type_ = PageType::Leaf;
+        size_ = 0;
+        parent_ = INVALID_PAGE_ID;
+        left_sibling_ = INVALID_PAGE_ID;
+        right_sibling_ = INVALID_PAGE_ID;
+    }
+
+    int LowerBound(const KeyPair<KeyType, ValueType>& kp) const {
+        if (size_ <= 0) {
+            return 0;
+        }
+        int lo = 0, hi = size_ - 1, ans = hi;
+        while (lo <= hi) {
+            int mid = (lo + hi) / 2;
+            if (data_[mid] < kp) lo = mid + 1;
+            else { ans = mid; hi = mid - 1; }
+        }
+        return ans;
+    }
+
+    int LowerBoundByKey(const KeyType& key) const {
+        if (size_ <= 0) {
+            return 0;
+        }
+        int lo = 0, hi = size_ - 1, ans = hi;
+        while (lo <= hi) {
+            int mid = (lo + hi) / 2;
+            if (key_less(data_[mid], key)) lo = mid + 1;
+            else { ans = mid; hi = mid - 1; }
+        }
+        return ans;
+    }
+
+    KeyPair<KeyType, ValueType> Front() const {
+        return size_ ? data_[0] : KeyPair<KeyType, ValueType>();
+    }
+    KeyPair<KeyType, ValueType> Back() const {
+        return size_ ? data_[size_ - 1] : KeyPair<KeyType, ValueType>();
+    }
+};
 
 } // namespace sjtu
 

@@ -3,122 +3,74 @@
 
 #include <string>
 #include <fstream>
+#include <mutex>
+#include <cstring>
 
 #include "config.hpp"
-#include "type_helper.hpp"
 
 namespace sjtu {
-#define DISKMANAGER_TYPE DiskManager<FixedType, FixedInfoType, info_len>
-#define DISKMANAGER_TEMPLATE_ARGS template<typename FixedType, typename FixedInfoType, int info_len>
 
-template<typename FixedType, typename FixedInfoType = diskpos_t, int info_len = 4>
+// Non-template DiskManager that reads/writes fixed-size PAGE_SIZE blocks.
+// Page 0 is at file offset 0, page 1 at PAGE_SIZE, etc.
 class DiskManager {
 private:
     std::fstream file_;
     std::string file_name_;
-    constexpr static diskpos_t sizeofT = sizeof(FixedType);
-    constexpr static diskpos_t sizeofInfo = sizeof(FixedInfoType);
-    constexpr static diskpos_t info_offset = info_len * sizeofInfo;
-    
-    bool open_file();
+    std::mutex io_mutex_;
+
+    bool OpenFile() {
+        file_.open(file_name_, std::ios::in | std::ios::out | std::ios::binary);
+        if (!file_) {
+            // Create new file
+            file_.open(file_name_, std::ios::out | std::ios::binary);
+            file_.close();
+            file_.open(file_name_, std::ios::in | std::ios::out | std::ios::binary);
+            // Write an empty header page (page 0)
+            char buf[PAGE_SIZE];
+            std::memset(buf, 0, PAGE_SIZE);
+            file_.write(buf, PAGE_SIZE);
+            file_.flush();
+            return false;
+        }
+        return true;
+    }
 
 public:
     DiskManager() = default;
 
-    ~DiskManager();
+    ~DiskManager() {
+        if (file_.is_open()) file_.close();
+    }
 
-    bool initialise(const std::string& file_name = "default.dat");
+    bool Initialize(const std::string& file_name) {
+        file_name_ = file_name;
+        return OpenFile();
+    }
 
-    void get_info(FixedInfoType& info, int idx);
+    void ReadPage(page_id_t page_id, char* data) {
+        std::lock_guard<std::mutex> lock(io_mutex_);
+        file_.seekg(static_cast<std::streamoff>(page_id) * PAGE_SIZE);
+        file_.read(data, PAGE_SIZE);
+    }
 
-    void write_info(FixedInfoType& info, int idx);
+    void WritePage(page_id_t page_id, const char* data) {
+        std::lock_guard<std::mutex> lock(io_mutex_);
+        file_.seekp(static_cast<std::streamoff>(page_id) * PAGE_SIZE);
+        file_.write(data, PAGE_SIZE);
+        file_.flush();
+    }
 
-    void read(FixedType& t, const diskpos_t pos);
-
-    void update(FixedType& t, const diskpos_t pos);
-
-    diskpos_t write(FixedType& t);
+    // Allocate a new page by extending the file. Returns the new page_id.
+    page_id_t AllocatePage(page_id_t page_id) {
+        std::lock_guard<std::mutex> lock(io_mutex_);
+        char buf[PAGE_SIZE];
+        std::memset(buf, 0, PAGE_SIZE);
+        file_.seekp(static_cast<std::streamoff>(page_id) * PAGE_SIZE);
+        file_.write(buf, PAGE_SIZE);
+        file_.flush();
+        return page_id;
+    }
 };
-
-DISKMANAGER_TEMPLATE_ARGS
-bool DISKMANAGER_TYPE::open_file() {
-    file_.open(file_name_, std::ios::in | std::ios::out | std::ios::binary);
-    if (!file_) {
-        file_.open(file_name_, std::ios::out | std::ios::binary);
-        file_.close();
-        file_.open(file_name_, std::ios::in | std::ios::out | std::ios::binary);
-        int temp = 0;
-        for (int i = 0; i < info_len; i++) {
-            file_.write(reinterpret_cast<char *>(&temp), sizeof(int));
-        }
-        return false;
-    }
-    return true;
-}
-
-DISKMANAGER_TEMPLATE_ARGS
-DISKMANAGER_TYPE::~DiskManager() {
-    if (file_.is_open()) {
-        file_.close();
-    }
-}
-
-DISKMANAGER_TEMPLATE_ARGS
-bool DISKMANAGER_TYPE::initialise(const std::string& file_name) {
-    file_name_ = file_name;
-    bool f = open_file();
-    return f;
-}
-
-DISKMANAGER_TEMPLATE_ARGS
-void DISKMANAGER_TYPE::get_info(FixedInfoType &info, int idx) {
-    if (idx < 1 || idx > info_len) {
-        return;
-    }
-    if (!file_.is_open()) {
-        open_file();
-    }
-    if (!file_) {
-        return;
-    }
-    file_.seekg((idx - 1) * sizeofInfo);
-    file_.read(reinterpret_cast<char *>(&info), sizeofInfo);
-}
-
-DISKMANAGER_TEMPLATE_ARGS
-void DISKMANAGER_TYPE::write_info(FixedInfoType& info, int idx) {
-    if (idx < 1 || idx > info_len) {
-        return;
-    }
-    if (!file_.is_open()) {
-        open_file();
-    }
-    if (!file_) {
-        return;
-    }
-    file_.seekp((idx - 1) * sizeofInfo);
-    file_.write(reinterpret_cast<char *>(&info), sizeofInfo);
-}
-
-DISKMANAGER_TEMPLATE_ARGS
-void DISKMANAGER_TYPE::read(FixedType& t, const diskpos_t pos) {
-    file_.seekg(pos);
-    file_.read(reinterpret_cast<char *>(&t), sizeofT);
-}
-
-DISKMANAGER_TEMPLATE_ARGS
-void DISKMANAGER_TYPE::update(FixedType &t, const diskpos_t pos) {
-    file_.seekp(pos);
-    file_.write(reinterpret_cast<char *>(&t), sizeofT);
-}
-
-DISKMANAGER_TEMPLATE_ARGS
-diskpos_t DISKMANAGER_TYPE::write(FixedType& t) {
-    file_.seekp(0, std::ios::end);
-    diskpos_t pos = file_.tellp();
-    file_.write(reinterpret_cast<char *>(&t), sizeofT);
-    return pos;
-}
 
 } // namespace sjtu
 
