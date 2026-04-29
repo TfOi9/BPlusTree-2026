@@ -25,7 +25,6 @@ private:
     };
     DiskManager<PAGE_TYPE> disk_;
     sjtu::unordered_map<diskpos_t, CacheEntry> cache_;
-    // sjtu::unordered_set<diskpos_t> cache_in_use_;
     sjtu::list<diskpos_t> lru_list_;
     size_t cache_capacity_;
 
