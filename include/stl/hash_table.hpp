@@ -26,6 +26,19 @@ struct MemoryHash {
     }
 };
 
+template<>
+struct MemoryHash<int64_t> {
+    size_t operator()(const int64_t& obj) const noexcept {
+        int64_t key = obj;
+        key ^= key >> 33;
+        key *= 0xff51afd7ed558ccdull;
+        key ^= key >> 33;
+        key *= 0xc4ceb9fe1a85ec53ull;
+        key ^= key >> 33;
+        return key;
+    }
+};
+
 } // namespace hash
 
 template<typename KeyType, typename ValueType = void, typename Hasher = hash::MemoryHash<KeyType>>
