@@ -8,10 +8,10 @@ namespace sjtu {
 
 typedef int64_t diskpos_t;
 
-constexpr size_t PAGE_SLOT_COUNT = 100;
+constexpr size_t PAGE_SLOT_COUNT = 110;
 static_assert(PAGE_SLOT_COUNT % 2 == 0, "Slot count must be even!");
 
-constexpr size_t CACHE_CAPACITY = 3400;
+constexpr size_t CACHE_CAPACITY = 2900;
 
 typedef int64_t hash_t;
 
