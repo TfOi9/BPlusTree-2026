@@ -7,7 +7,7 @@
 namespace sjtu {
 namespace anon {
 
-constexpr int MAX_SIZE = 4096;
+constexpr int MAX_SIZE = 8192;
 constexpr int PROBE_LIMIT = 32;
 constexpr uint64_t EMPTY_SLOT = UINT64_MAX;
 constexpr uint64_t DELETED_SLOT = UINT64_MAX - 1;
