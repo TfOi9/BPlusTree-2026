@@ -1,13 +1,14 @@
 #ifndef BUFFER_HPP
 #define BUFFER_HPP
 
+#include <cstdint>
 #include <memory>
 
 #include "config.hpp"
 #include "page.hpp"
 #include "disk.hpp"
+#include "stl/cache_hash.hpp"
 #include "stl/list.hpp"
-#include "stl/unordered_map.hpp"
 
 namespace sjtu {
 #define BUFFER_MANAGER_TYPE BufferManager<KeyType, ValueType>
@@ -24,7 +25,7 @@ private:
         typename sjtu::list<diskpos_t>::iterator lru_it_;
     };
     DiskManager<PAGE_TYPE> disk_;
-    sjtu::unordered_map<diskpos_t, CacheEntry> cache_;
+    sjtu::anon::cache_hash<CacheEntry> cache_;
     sjtu::list<diskpos_t> lru_list_;
     size_t cache_capacity_;
 
@@ -82,30 +83,31 @@ void BUFFER_MANAGER_TYPE::evict() {
     }
     for (auto rit = lru_list_.rbegin(); rit != lru_list_.rend(); rit++) {
         diskpos_t cand = *rit;
-        auto it = cache_.find(cand);
-        if (it->second->pin_count_ > 0) {
+        auto entry = cache_.find(static_cast<uint64_t>(cand));
+        if (!entry) {
             continue;
         }
-        if (it != cache_.end()) {
-            if (it->second->dirty_) {
-                disk_.update(*(it->second->page_), cand);
-            }
-            auto forward_it = rit.base();
-            --forward_it;
-            lru_list_.erase(forward_it);
-            cache_.erase(cand);
-            return;
+        if (entry->pin_count_ > 0) {
+            continue;
         }
+        if (entry->dirty_) {
+            disk_.update(*(entry->page_), cand);
+        }
+        auto forward_it = rit.base();
+        --forward_it;
+        lru_list_.erase(forward_it);
+        cache_.erase(static_cast<uint64_t>(cand));
+        return;
     }
 }
 
 BUFFER_MANAGER_TEMPLATE_ARGS
 void BUFFER_MANAGER_TYPE::promote(diskpos_t pos) {
-    auto it = cache_.find(pos);
-    if (it != cache_.end()) {
-        lru_list_.erase(it->second->lru_it_);
+    auto entry = cache_.find(static_cast<uint64_t>(pos));
+    if (entry) {
+        lru_list_.erase(entry->lru_it_);
         lru_list_.push_front(pos);
-        it->second->lru_it_ = lru_list_.begin();
+        entry->lru_it_ = lru_list_.begin();
     }
 }
 
@@ -120,46 +122,46 @@ void BUFFER_MANAGER_TYPE::load(diskpos_t pos) {
     entry.dirty_ = false;
     lru_list_.push_front(pos);
     entry.lru_it_ = lru_list_.begin();
-    cache_[pos] = entry;
+    cache_[static_cast<uint64_t>(pos)] = entry;
 }
 
 BUFFER_MANAGER_TEMPLATE_ARGS
 std::shared_ptr<const PAGE_TYPE> BUFFER_MANAGER_TYPE::get_page(diskpos_t pos) {
-    auto it = cache_.find(pos);
-    if (it != cache_.end()) {
+    auto entry = cache_.find(static_cast<uint64_t>(pos));
+    if (entry) {
         promote(pos);
-        return std::const_pointer_cast<const PAGE_TYPE>(it->second->page_);
+        return std::const_pointer_cast<const PAGE_TYPE>(entry->page_);
     }
     if (cache_.size() >= cache_capacity_) {
         evict();
     }
     load(pos);
-    return std::const_pointer_cast<const PAGE_TYPE>(cache_[pos].page_);
+    return std::const_pointer_cast<const PAGE_TYPE>(cache_[static_cast<uint64_t>(pos)].page_);
 }
 
 BUFFER_MANAGER_TEMPLATE_ARGS
 std::shared_ptr<PAGE_TYPE> BUFFER_MANAGER_TYPE::get_page_mutable(diskpos_t pos) {
-    auto it = cache_.find(pos);
-    if (it != cache_.end()) {
+    auto entry = cache_.find(static_cast<uint64_t>(pos));
+    if (entry) {
         promote(pos);
         mark_dirty(pos);
-        cache_[pos].pin_count_++;
-        return it->second->page_;
+        cache_[static_cast<uint64_t>(pos)].pin_count_++;
+        return entry->page_;
     }
     if (cache_.size() >= cache_capacity_) {
         evict();
     }
     load(pos);
     mark_dirty(pos);
-    cache_[pos].pin_count_++;
-    return cache_[pos].page_;
+    cache_[static_cast<uint64_t>(pos)].pin_count_++;
+    return cache_[static_cast<uint64_t>(pos)].page_;
 }
 
 BUFFER_MANAGER_TEMPLATE_ARGS
 void BUFFER_MANAGER_TYPE::mark_dirty(diskpos_t pos) {
-    auto it = cache_.find(pos);
-    if (it != cache_.end()) {
-        it->second->dirty_ = true;
+    auto entry = cache_.find(static_cast<uint64_t>(pos));
+    if (entry) {
+        entry->dirty_ = true;
     }
 }
 
@@ -177,16 +179,17 @@ diskpos_t BUFFER_MANAGER_TYPE::insert_page(Page<KeyType, ValueType> &page) {
     entry.dirty_ = false;
     lru_list_.push_front(pos);
     entry.lru_it_ = lru_list_.begin();
-    cache_[pos] = entry;
+    cache_[static_cast<uint64_t>(pos)] = entry;
     return pos;
 }
 
 BUFFER_MANAGER_TEMPLATE_ARGS
 void BUFFER_MANAGER_TYPE::flush() {
-    for (auto& pair : cache_) {
-        if (pair.second->dirty_) {
-            disk_.update(*(pair.second->page_), *pair.first);
-            pair.second->dirty_ = false;
+    for (auto it = lru_list_.begin(); it != lru_list_.end(); ++it) {
+        auto entry = cache_.find(static_cast<uint64_t>(*it));
+        if (entry && entry->dirty_) {
+            disk_.update(*(entry->page_), *it);
+            entry->dirty_ = false;
         }
     }
     cache_.clear();
@@ -207,10 +210,11 @@ void BUFFER_MANAGER_TYPE::set_root_pos(diskpos_t pos) {
 
 BUFFER_MANAGER_TEMPLATE_ARGS
 void BUFFER_MANAGER_TYPE::finish_use(diskpos_t pos) {
-    if (cache_.find(pos) == cache_.end()) {
+    auto entry = cache_.find(static_cast<uint64_t>(pos));
+    if (!entry) {
         return;
     }
-    cache_[pos].pin_count_--;
+    entry->pin_count_--;
 }
 
 BUFFER_MANAGER_TEMPLATE_ARGS
