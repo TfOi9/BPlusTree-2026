@@ -45,7 +45,7 @@ inline bool operator>=(const FixedString65& a, const FixedString65& b) {
 
 // Fast buffered IO for token-heavy input.
 struct FastIO {
-	static constexpr size_t IOBUF_SIZE = 1 << 20;
+	static constexpr size_t IOBUF_SIZE = 1 << 16;
 	char inbuf[IOBUF_SIZE];
 	char outbuf[IOBUF_SIZE];
 	size_t inpos;
