@@ -129,24 +129,54 @@ struct FastIO {
 	}
 
 	inline void write_int(int x) {
-		if (x == 0) {
-			write_char('0');
-			return;
+		static const char DIGIT_PAIRS[] =
+			"00010203040506070809"
+			"10111213141516171819"
+			"20212223242526272829"
+			"30313233343536373839"
+			"40414243444546474849"
+			"50515253545556575859"
+			"60616263646566676869"
+			"70717273747576777879"
+			"80818283848586878889"
+			"90919293949596979899";
+
+		char tmp[16];
+		char* p = tmp + sizeof(tmp);
+		unsigned int v = 0;
+		if (x < 0) {
+			v = static_cast<unsigned int>(-static_cast<long long>(x));
 		}
-		long long val = x;
-		if (val < 0) {
-			write_char('-');
-			val = -val;
+		else {
+			v = static_cast<unsigned int>(x);
 		}
-		char tmp[24];
-		int n = 0;
-		while (val > 0) {
-			tmp[n++] = static_cast<char>('0' + (val % 10));
-			val /= 10;
+
+		while (v >= 100) {
+			unsigned int q = v / 100;
+			unsigned int r = v - q * 100;
+			const char* pair = DIGIT_PAIRS + r * 2;
+			*--p = pair[1];
+			*--p = pair[0];
+			v = q;
 		}
-		for (int i = n - 1; i >= 0; --i) {
-			write_char(tmp[i]);
+		if (v < 10) {
+			*--p = static_cast<char>('0' + v);
 		}
+		else {
+			const char* pair = DIGIT_PAIRS + v * 2;
+			*--p = pair[1];
+			*--p = pair[0];
+		}
+		if (x < 0) {
+			*--p = '-';
+		}
+
+		size_t len = static_cast<size_t>((tmp + sizeof(tmp)) - p);
+		if (outpos + len > IOBUF_SIZE) {
+			flush();
+		}
+		std::memcpy(outbuf + outpos, p, len);
+		outpos += len;
 	}
 
 	inline void flush() {
