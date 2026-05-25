@@ -1,9 +1,9 @@
 #include <cstdio>
 #include <cstring>
 #include <string>
-#include <vector>
 
 #include "../include/bpt.hpp"
+#include "../include/stl/vector.hpp"
 
 // Fixed-length string key to ensure POD storage on disk
 struct FixedString65 {
@@ -177,7 +177,7 @@ int main() {
 		}
 		else if (op[0] == 'f') {
 			io.read_token(key, sizeof(key));
-			std::vector<int> vec;
+			sjtu::vector<int> vec;
 			bpt.find_all(FixedString65(key), vec);
 			if (vec.empty()) {
 				io.write_string("null\n");
